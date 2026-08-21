@@ -1,0 +1,24 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+
+  expert-my-rules:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./workspaces:/data/workspaces
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - AWB_LOCAL_MODEL=${AWB_LOCAL_MODEL:-qwen3:8b}
+      - AWB_PLANNER_MODEL=${AWB_PLANNER_MODEL:-qwen3:8b}
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+volumes:
+  ollama-models:

@@ -1,45 +1,92 @@
-# Architecture
+# Expert My Rules — Architecture
 
-## Design invariant
+## Product invariant
 
-The runtime is domain-agnostic. A project is defined by five things:
+The user should primarily define **what done looks like**, not how to orchestrate agents.
 
-1. **Goal** — stable north star.
-2. **State** — persistent ledger of tasks, objections, evidence and gates.
-3. **Agents** — interchangeable roles operating on state.
-4. **Tools / validators** — external sources of truth.
-5. **Gates** — explicit completion predicates.
+A project consists of:
 
-## Runtime loop
+1. **North Star** — the stable final objective.
+2. **Proposed Definition of Done** — explicit completion gates generated locally and editable by the user.
+3. **Dynamic expert workflow** — Director, Worker, independent Reviewer and Verifier roles; domain templates may specialize them.
+4. **Persistent state** — tasks, attempts, objections, gate decisions, artifacts, events and job state in SQLite.
+5. **Tool capabilities** — explicitly granted, deny-by-default actions.
+6. **Model routing policy** — local-first inference with optional budget-gated cloud escalation.
 
-1. Director selects one high-information task.
-2. Worker executes it.
-3. Adversarial reviewer tries to reject it.
-4. External validators run.
-5. Ledger records evidence and objections.
-6. Gates are reevaluated.
-7. Repeat until all required gates pass or the caller stops the bounded run.
+## Goal-first planning
 
-The orchestrator itself never accepts a free-form `DONE` assertion from an agent as proof of completion.
+The default UI asks for a final goal. A local Ollama planner proposes:
 
-## Provider boundary
+- research/software/custom project type;
+- expert roles and instructions;
+- completion conditions.
 
-`ModelProvider.generate(system, user)` is the only model-facing API in the MVP.
-Providers currently implemented:
+If Ollama is unavailable during project creation, a deterministic domain template is used. Planning never falls back to a paid cloud provider.
 
-- Mock (offline deterministic testing)
-- Ollama (local)
-- OpenAI Responses API (optional)
+## Autonomous loop
 
-Future routing can implement per-role models and escalation policies without changing the project model.
+`Goal → Director → Worker → Adversarial Reviewer → External/semantic Verifier → Ledger → next task`
+
+The Director is explicitly forbidden from weakening the North Star or moving completion criteria to manufacture success.
+
+After each accepted/rejected task:
+
+- external validators run where configured;
+- the independent verifier evaluates non-manual semantic completion gates conservatively;
+- the project stops only when every required gate is PASS.
+
+Manual gates remain available for goals that genuinely require a human decision, but are not the default.
+
+## Continuous projects
+
+A project-level run is not one infinite LLM context. It is a sequence of bounded checkpoint sessions. The outer continuous job remains ACTIVE until:
+
+- all required gates pass;
+- the user pauses it;
+- the user cancels it;
+- a fatal runtime/provider error occurs.
+
+Continuous job state is persisted. On service startup, RUNNING continuous jobs are recovered and resumed.
+
+## Model routing
+
+Default provider: local Ollama.
+
+Cloud escalation is structurally present but disabled by default. It requires all of:
+
+- `escalation.enabled = true`;
+- positive configured monetary budget;
+- positive cloud-call cap;
+- an `OPENAI_API_KEY` environment variable;
+- a role/task satisfying escalation policy (e.g. repeated local failure or high priority).
+
+Every escalation is logged. With the default configuration, cloud escalation is impossible.
+
+## Tool layer
+
+Tools are capability-based and deny-by-default. Current primitives include sandboxed workspace file listing/read/write and fixed configured shell commands. A model cannot invent arbitrary shell commands from a fixed shell tool.
 
 ## Persistence
 
-Each workspace contains:
+Each workspace owns:
 
-- `project.yaml` — declarative project configuration
-- `ledger.sqlite3` — task/event/gate state
-- `artifacts/` — generated project outputs
-- `logs/` — runtime logs
+- `project.yaml` — portable goal/team/gates/tools/runtime policy;
+- `ledger.sqlite3` — tasks, events, gate state and continuous jobs;
+- `artifacts/` — candidate outputs + reviews + verification evidence;
+- `logs/` — runtime/service logs.
 
-Git versions source, manifests and artifacts selected for commit; transient DB/log files are ignored by default.
+## Deployment
+
+Recommended H24 deployment is Docker Compose:
+
+- Expert My Rules service;
+- local Ollama service;
+- persistent workspace volume;
+- persistent Ollama model volume;
+- `restart: unless-stopped`.
+
+The same application can run natively on Python 3.11+.
+
+## Correctness boundary
+
+Independent LLM review is not equivalent to formal proof or external scientific validation. The architecture therefore treats completion as a configurable evidence problem and supports external validators. For serious mathematical research the natural next adapters are literature retrieval, Lean, SymPy and numerical counterexample search.

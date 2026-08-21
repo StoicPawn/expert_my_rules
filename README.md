@@ -1,79 +1,174 @@
-# Autonomous Workbench (AWB)
+# Expert My Rules
 
-Local-first framework for iterative autonomous work on research, software, data-analysis and custom projects.
+**Tell it what done looks like.**
 
-The core loop is deliberately domain-agnostic:
+Expert My Rules is a local-first autonomous project workbench. The normal workflow is deliberately simple:
 
-`Goal -> Director -> Worker -> Reviewer -> Verifier -> State update -> next task -> completion gates`
+1. Give one final goal.
+2. The local planner proposes the project type, expert team and Definition of Done.
+3. Edit those conditions if you want.
+4. Press **Start autonomous project**.
+5. The project keeps taking checkpointed autonomous sessions until every required completion gate passes, or you pause/cancel it.
 
-The framework does **not** trust an LLM saying that a project is finished. Completion is determined by explicit workspace gates and external validators where available.
+The core loop is:
 
-## Current MVP
+`Goal → Director → Worker → independent adversarial Reviewer → external verification → persistent ledger → next task`
 
-- Git-friendly project workspaces with YAML manifests.
-- Persistent SQLite task/decision ledger.
-- Reusable agent roles: director, worker, reviewer, verifier.
-- Model gateway with `mock`, local `ollama`, and optional `openai` providers.
-- Research and software workspace templates.
-- One-step and bounded-loop execution.
-- Minimal web dashboard usable from another device on the LAN, including an iPad.
-- Every iteration persists prompts, outputs, objections and task status.
+The Director may choose new tasks and strategies, but it is explicitly forbidden from weakening the North Star or moving the completion criteria merely to declare success.
 
-## Quick start
+## Local-first by default
+
+The default model provider is **Ollama**. Cloud escalation exists in the architecture but is OFF by default:
+
+```yaml
+escalation:
+  enabled: false
+  daily_budget_eur: 0
+  max_cloud_calls_per_run: 0
+```
+
+An OpenAI escalation can occur only if all of these are true:
+
+- escalation is enabled for the workspace;
+- the configured cloud budget is greater than zero;
+- a positive cloud-call cap is configured;
+- `OPENAI_API_KEY` exists in the environment;
+- the task is important enough or has failed locally enough times according to policy.
+
+Therefore a fresh installation makes **zero API calls**. ChatGPT subscriptions are separate from API billing; Expert My Rules never assumes an API entitlement.
+
+## H24 server setup
+
+Docker Compose is the recommended deployment. It starts both Expert My Rules and Ollama, persists workspaces and model files, and restarts services automatically.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+git clone https://github.com/StoicPawn/expert_my_rules.git
+cd expert_my_rules
+docker compose up -d --build
+```
 
-awb init research my-theory --goal "Prove or refute the central conjecture"
-awb run workspaces/my-theory --provider mock --max-steps 3
+Pull the local model once:
+
+```bash
+docker compose exec ollama ollama pull qwen3:8b
+```
+
+Then open:
+
+- PC: `http://localhost:8000`
+- iPad/another device on the same private network: `http://<SERVER-IP>:8000`
+
+The server can remain online H24. Ollama is a service: it only performs inference when a project asks for it.
+
+## Goal-first creation
+
+From the dashboard, the main creation screen asks essentially one question:
+
+> What must exist when this project is truly finished?
+
+For example:
+
+> Obtain a rigorous, novel result strong enough for a submission-ready Annals of Probability paper.
+
+The local planner infers a research workspace and proposes agents and completion conditions. If Ollama is temporarily unavailable during creation, a deterministic domain template is used instead; project creation never falls back to a paid API.
+
+CLI equivalent:
+
+```bash
+awb create --goal "Obtain a rigorous, novel result strong enough for a submission-ready Annals of Probability paper"
+```
+
+Advanced users can still create explicit templates with `awb init`.
+
+## Definition of Done
+
+Completion is gate-based, not based on an LLM saying `DONE`.
+
+A research workspace typically proposes conditions such as:
+
+- central result proved or strongest valid replacement established;
+- no unresolved fatal adversarial objection;
+- novelty/priority checked against literature;
+- major claims verified at the strongest available level;
+- complete manuscript package ready for expert submission review.
+
+A software workspace typically proposes:
+
+- tests pass;
+- no critical bugs remain;
+- requested acceptance criteria are satisfied;
+- release/install/run package is complete.
+
+You can modify or add gates before launch.
+
+## Continuous autonomous projects
+
+From the UI press **Start autonomous project**, or from the CLI:
+
+```bash
+awb launch workspaces/<project>
+```
+
+A continuous project is split internally into bounded checkpoint sessions. This avoids one unbounded context/run while preserving the project-level rule: **keep working until the required gates pass**.
+
+Continuous job state is persisted in SQLite. The dashboard provides pause, resume and cancel controls. On service startup, running continuous jobs are recovered and resumed.
+
+You can still inject a temporary directive without changing the North Star, e.g.:
+
+> Tonight attack the converse by searching for counterexamples first.
+
+## Model escalation
+
+Local inference is the normal path. A future API budget can be enabled per workspace from the UI or CLI:
+
+```bash
+awb cloud workspaces/<project> \
+  --enabled \
+  --daily-budget 2 \
+  --max-calls 5 \
+  --model gpt-5
+```
+
+With the current default (`enabled=false`, budget `0`, max calls `0`) it cannot escalate.
+
+The router considers cloud escalation only for configured roles and only after sufficient local failures or for high-priority tasks. Every escalation is written into the event ledger.
+
+## Tool Layer
+
+Agents receive capabilities explicitly. Tools are deny-by-default.
+
+Current primitives include:
+
+- workspace file listing;
+- sandboxed file reads;
+- sandboxed file writes;
+- fixed configured shell commands such as tests.
+
+A model cannot invent an arbitrary shell command just because a shell tool exists; the command is configured in the workspace.
+
+## Installation without Docker
+
+Python 3.11+ is supported.
+
+macOS/Linux:
+
+```bash
+./install.sh
+. .venv/bin/activate
 awb serve --host 0.0.0.0 --port 8000
 ```
 
-Open `http://<PC-IP>:8000` from another device on the same network.
+Windows PowerShell:
 
-### Ollama
-
-Install and run Ollama separately, then:
-
-```bash
-awb run workspaces/my-theory --provider ollama --model qwen3:8b --max-steps 10
+```powershell
+./install.ps1
+.\.venv\Scripts\awb serve --host 0.0.0.0 --port 8000
 ```
 
-### OpenAI API
+For native installation, run Ollama separately and point `OLLAMA_BASE_URL` to it.
 
-API use is optional and separate from the local-first workflow. Set:
+## Important boundary
 
-```bash
-export OPENAI_API_KEY="..."
-awb run workspaces/my-theory --provider openai --model gpt-5 --max-steps 5
-```
+Expert My Rules can automate research, implementation, criticism and verification workflows, but high-stakes claims remain subject to the strength of the configured validators. In mathematical research, several agreeing LLMs are not a formal proof checker. The system is designed to make unsupported completion difficult and to preserve the complete evidence/objection trail, not to replace external mathematical or scientific validation.
 
-No API key is stored in project files.
-
-## Workspace manifest
-
-Each workspace owns a `project.yaml` file describing:
-
-- north-star goal;
-- agent roles;
-- completion gates;
-- validator commands;
-- iteration policy.
-
-The same runtime can therefore execute a mathematical research project or a software project without hard-coding either domain into the orchestrator.
-
-## Safety / correctness principle
-
-`PAPER_READY`, `RELEASE_READY`, or similar terminal states are candidate states only. For high-stakes claims (e.g. new mathematics), final human/domain-expert review remains mandatory.
-
-## Roadmap
-
-1. Structured task DAG and dependency graph.
-2. Git branch-per-task execution for software projects.
-3. Browser/literature and GitHub tools.
-4. Formal-verification adapters (Lean) and symbolic/numerical validators.
-5. Provider escalation policies: cheap local model -> stronger local -> cloud API.
-6. Multi-model independent referee panels.
-7. Rich iPad-first UI and artifact diff/review.
+See `ARCHITECTURE.md` and `REMOTE_ACCESS.md` for architecture and private-network deployment guidance.
