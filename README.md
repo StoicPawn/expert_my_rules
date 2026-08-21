@@ -16,6 +16,55 @@ The core loop is:
 
 The Director may choose new tasks and strategies, but it is explicitly forbidden from weakening the North Star or moving the completion criteria merely to declare success.
 
+## What runs where
+
+With the recommended Docker setup, the same PC runs two persistent services:
+
+```text
+Acer / home server
+├─ expert-my-rules
+│  ├─ web dashboard :8000
+│  ├─ orchestrator
+│  ├─ project ledger / artifacts
+│  └─ model router
+└─ ollama
+   ├─ local LLM server :11434 (internal Docker network)
+   └─ downloaded model weights in a persistent Docker volume
+```
+
+Expert My Rules sends normal model requests to `http://ollama:11434`. Ollama does **not** continuously generate tokens: it stays available as a service and performs inference only when the planner or an agent asks for it. The model weights are downloaded once and persisted in the `ollama-models` Docker volume.
+
+Your browser or iPad is only a client. Closing Safari does not move the computation to the iPad and does not stop a running server-side project.
+
+## Start on a small Acer now
+
+Yes: the intended first deployment is a normal always-on PC such as an Acer. It is the same complete system, only with a smaller local model and therefore less reasoning speed/capability than a future GPU server.
+
+Recommended first setup:
+
+```bash
+git clone https://github.com/StoicPawn/expert_my_rules.git
+cd expert_my_rules
+docker compose up -d --build
+docker compose exec ollama ollama pull qwen3:8b
+```
+
+Then open:
+
+- on the Acer: `http://localhost:8000`
+- from an iPad/PC on the same private network: `http://<ACER-IP>:8000`
+
+Check the services:
+
+```bash
+docker compose ps
+docker compose exec ollama ollama list
+```
+
+The default local model is `qwen3:8b`. If the Acer has limited RAM, use a smaller Ollama model and set `AWB_LOCAL_MODEL` / `AWB_PLANNER_MODEL` accordingly. If it has more RAM or a useful GPU, use a larger model. The application architecture does not change.
+
+Practical hardware rule: the machine must have enough RAM/VRAM for the chosen Ollama model. CPU-only inference works but can be slow. A GPU improves speed substantially; it is not required for the framework itself.
+
 ## Local-first by default
 
 The default model provider is **Ollama**. Cloud escalation exists in the architecture but is OFF by default:
@@ -37,28 +86,72 @@ An OpenAI escalation can occur only if all of these are true:
 
 Therefore a fresh installation makes **zero API calls**. ChatGPT subscriptions are separate from API billing; Expert My Rules never assumes an API entitlement.
 
+### What happens today without an API account
+
+Nothing special is required. Leave the defaults unchanged. Every planner/Director/Worker/Reviewer/verifier call stays on Ollama. The cloud router exists but cannot activate because its budget and call cap are zero and no API key is required.
+
+### How API escalation works later
+
+When you later create an OpenAI API account, set the key only in the server environment (never in `project.yaml`) and explicitly give the workspace a positive budget/call cap:
+
+```bash
+export OPENAI_API_KEY="..."
+awb cloud workspaces/<project> \
+  --enabled \
+  --daily-budget 2 \
+  --max-calls 5 \
+  --model gpt-5
+```
+
+The router still uses Ollama normally. It may escalate only under the configured policy, for example after repeated local failures or for a high-priority independent review. Every escalation is recorded in the ledger.
+
 ## H24 server setup
 
-Docker Compose is the recommended deployment. It starts both Expert My Rules and Ollama, persists workspaces and model files, and restarts services automatically.
+Docker Compose is the recommended deployment. It starts both Expert My Rules and Ollama, persists workspaces and model files, and restarts services automatically with `restart: unless-stopped`.
 
-```bash
-git clone https://github.com/StoicPawn/expert_my_rules.git
-cd expert_my_rules
-docker compose up -d --build
+The server can remain online H24. When no project is working, Ollama performs no inference. When you launch or resume a project, the local agents call Ollama on demand.
+
+Workspace state lives under `./workspaces`; local model files live in the persistent `ollama-models` Docker volume. Rebuilding the application container therefore does not erase your projects or downloaded Ollama models.
+
+## Scale later without changing projects
+
+The deployment is deliberately portable. A project contains its goal, proposed team, gates, ledger and artifacts independently from the machine that executes it.
+
+### Stage 1 — small Acer
+
+```text
+iPad/PC → Acer
+          ├─ Expert My Rules
+          └─ Ollama + small/medium local model
 ```
 
-Pull the local model once:
+Use this now. It costs no per-token API money and is enough to validate workflows and run lighter autonomous projects.
 
-```bash
-docker compose exec ollama ollama pull qwen3:8b
+### Stage 2 — stronger physical server
+
+Move the repo/workspaces to a machine with more RAM and/or a GPU, keep the same Docker architecture and use a stronger Ollama model:
+
+```text
+iPad/PC → GPU server
+          ├─ Expert My Rules
+          └─ Ollama + larger local model
 ```
 
-Then open:
+No project format change is required.
 
-- PC: `http://localhost:8000`
-- iPad/another device on the same private network: `http://<SERVER-IP>:8000`
+### Stage 3 — hybrid local + API
 
-The server can remain online H24. Ollama is a service: it only performs inference when a project asks for it.
+Keep local inference as the default but allow expensive frontier-model calls only when the escalation policy permits them:
+
+```text
+                    ┌→ Ollama local (default)
+iPad → AWB router ──┤
+                    └→ OpenAI API (rare, budgeted escalation)
+```
+
+### Stage 4 — cloud/server migration
+
+Expert My Rules and/or Ollama can be moved to a private cloud VM/GPU server. The UI remains the same; only deployment URLs, storage and security/network configuration change. Keep the service private or behind VPN/authentication/TLS rather than directly exposing the current trusted-LAN dashboard to the public Internet.
 
 ## Goal-first creation
 
@@ -117,22 +210,6 @@ You can still inject a temporary directive without changing the North Star, e.g.
 
 > Tonight attack the converse by searching for counterexamples first.
 
-## Model escalation
-
-Local inference is the normal path. A future API budget can be enabled per workspace from the UI or CLI:
-
-```bash
-awb cloud workspaces/<project> \
-  --enabled \
-  --daily-budget 2 \
-  --max-calls 5 \
-  --model gpt-5
-```
-
-With the current default (`enabled=false`, budget `0`, max calls `0`) it cannot escalate.
-
-The router considers cloud escalation only for configured roles and only after sufficient local failures or for high-priority tasks. Every escalation is written into the event ledger.
-
 ## Tool Layer
 
 Agents receive capabilities explicitly. Tools are deny-by-default.
@@ -165,7 +242,7 @@ Windows PowerShell:
 .\.venv\Scripts\awb serve --host 0.0.0.0 --port 8000
 ```
 
-For native installation, run Ollama separately and point `OLLAMA_BASE_URL` to it.
+For native installation, install/run Ollama separately and point `OLLAMA_BASE_URL` to it. Docker is simpler because the bundled Compose file already connects the two services internally.
 
 ## Important boundary
 
