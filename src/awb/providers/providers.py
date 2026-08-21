@@ -10,6 +10,8 @@ from .base import ModelProvider
 class MockProvider(ModelProvider):
     """Deterministic provider for smoke tests and offline development."""
     def generate(self, system: str, user: str) -> str:
+        if "GATE_JSON" in system:
+            return json.dumps({"passed": False, "detail": "Mock verifier keeps semantic completion gates open."})
         if "DIRECTOR_JSON" in system or "Director of an autonomous" in system:
             return json.dumps({
                 "title": "Inspect current highest-priority gap",
