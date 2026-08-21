@@ -11,6 +11,7 @@ from awb.providers.base import ModelProvider
 from awb.providers.providers import make_provider
 from .models import IterationResult, Review, Task, TaskStatus, Workspace
 from .storage import Ledger
+from .tools import ToolRunner, ToolError, parse_tool_message
 
 
 DIRECTOR_SYSTEM = """You are the Director of an autonomous project workbench.
@@ -23,7 +24,9 @@ Return DIRECTOR_JSON only as JSON with: title, description, priority.
 WORKER_SYSTEM = """You are the Worker in an autonomous project workbench.
 Execute the assigned task rigorously. Produce a concrete result that can be inspected by another expert.
 Separate evidence, assumptions, uncertainty and conclusions. Do not claim completion without evidence.
-When the task concerns code or files, describe exact changes and validation evidence.
+When tools are available, you may call them by returning ONLY JSON of the form {"tool":"tool_id","arguments":{...}}.
+After a tool result is returned, continue the task. When finished, return the final candidate result as normal text.
+Never invent tool results.
 """
 
 REVIEW_SYSTEM = """You are an adversarial Reviewer. Try to reject the candidate result.
@@ -98,6 +101,39 @@ class Orchestrator:
         self.ledger.event("task_created", task.model_dump(mode="json"), task.id)
         return task
 
+    def _worker_with_tools(self, task: Task, worker_system: str, worker_prompt: str) -> str:
+        agent = self._agent("worker")
+        allowed = agent.tools if agent else []
+        runner = ToolRunner(self.workspace)
+        tool_desc = runner.describe(allowed)
+        if not tool_desc:
+            return self._provider("worker").generate(worker_system, worker_prompt)
+
+        system = worker_system + "\nAVAILABLE TOOLS:\n" + json.dumps(tool_desc, indent=2)
+        conversation = worker_prompt
+        provider = self._provider("worker")
+        max_calls = self.workspace.manifest.runtime.max_tool_calls_per_task
+        for call_index in range(max_calls + 1):
+            raw = provider.generate(system, conversation)
+            parsed = parse_tool_message(raw)
+            if not parsed:
+                return raw
+            tool_id, arguments = parsed
+            if tool_id not in allowed:
+                result = {"ok": False, "error": f"Tool not allowed for worker: {tool_id}"}
+            else:
+                try:
+                    result = runner.execute(tool_id, arguments)
+                except (ToolError, subprocess.TimeoutExpired, OSError) as exc:
+                    result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            self.ledger.event("tool_call", {"tool": tool_id, "arguments": arguments, "result": result}, task.id)
+            conversation += (
+                "\n\nTOOL CALL #" + str(call_index + 1) + ": " + json.dumps({"tool": tool_id, "arguments": arguments}) +
+                "\nTOOL RESULT:\n" + json.dumps(result, indent=2) +
+                "\nContinue. Call another tool if needed, otherwise return the final candidate result."
+            )
+        return "Tool-call budget exhausted before a final answer was produced."
+
     def verify(self, task: Task, work_output: str) -> tuple[bool, str]:
         validators = self.workspace.manifest.validators
         if not validators:
@@ -158,7 +194,7 @@ class Orchestrator:
             f"TASK:\n{task.title}\n{task.description}\n\nSTATE:\n{self.snapshot()}"
         )
         worker_system = WORKER_SYSTEM + "\nROLE-SPECIFIC RULES:\n" + self._instructions("worker")
-        work_output = self._provider("worker").generate(worker_system, worker_prompt)
+        work_output = self._worker_with_tools(task, worker_system, worker_prompt)
         self.ledger.event("work_output", {"text": work_output}, task.id)
 
         review_prompt = f"NORTH STAR:\n{self.workspace.manifest.goal}\n\nTASK:\n{task.model_dump_json()}\n\nCANDIDATE RESULT:\n{work_output}"
@@ -201,20 +237,39 @@ class Orchestrator:
             next_task=next_task,
         )
 
-    def run(self, max_steps: int | None = None, max_minutes: float | None = None) -> list[IterationResult]:
+    def run(
+        self,
+        max_steps: int | None = None,
+        max_minutes: float | None = None,
+        control=None,
+        on_step=None,
+    ) -> list[IterationResult]:
         max_steps = max_steps or self.workspace.manifest.runtime.max_steps_per_run
         max_minutes = max_minutes if max_minutes is not None else self.workspace.manifest.runtime.max_minutes_per_run
         deadline = time.monotonic() + max_minutes * 60 if max_minutes and max_minutes > 0 else None
         results: list[IterationResult] = []
         self.ledger.event("run_started", {"max_steps": max_steps, "max_minutes": max_minutes})
+        stop_reason = None
         for _ in range(max_steps):
+            if control is not None:
+                action = control()
+                while action == "pause":
+                    time.sleep(0.5)
+                    action = control()
+                if action == "cancel":
+                    stop_reason = "cancelled"
+                    break
             if self.is_complete():
+                stop_reason = "complete"
                 break
             if deadline is not None and time.monotonic() >= deadline:
-                self.ledger.event("run_stopped", {"reason": "time_budget"})
+                stop_reason = "time_budget"
                 break
-            results.append(self.step())
+            result = self.step()
+            results.append(result)
+            if on_step is not None:
+                on_step(len(results), result)
             if self.workspace.manifest.runtime.pause_seconds > 0:
                 time.sleep(self.workspace.manifest.runtime.pause_seconds)
-        self.ledger.event("run_finished", {"steps": len(results), "complete": self.is_complete()})
+        self.ledger.event("run_finished", {"steps": len(results), "complete": self.is_complete(), "reason": stop_reason or "step_budget"})
         return results
