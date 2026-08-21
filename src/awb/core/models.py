@@ -14,27 +14,43 @@ class TaskStatus(str, Enum):
     REJECTED = "REJECTED"
 
 
+class ProviderSpec(BaseModel):
+    kind: str = "mock"
+    model: str | None = None
+
+
 class Gate(BaseModel):
     id: str
     description: str
     required: bool = True
     validator: str | None = None
+    manual: bool = False
 
 
 class AgentSpec(BaseModel):
     id: str
     role: str
     instructions: str
+    provider: ProviderSpec | None = None
+
+
+class RuntimePolicy(BaseModel):
+    default_provider: ProviderSpec = Field(default_factory=ProviderSpec)
+    max_steps_per_run: int = 25
+    max_minutes_per_run: int = 60
+    max_task_attempts: int = 3
+    pause_seconds: float = 0.0
 
 
 class ProjectManifest(BaseModel):
     name: str
-    type: str
+    type: str = "custom"
     goal: str
+    description: str = ""
     agents: list[AgentSpec]
     gates: list[Gate]
     validators: dict[str, str] = Field(default_factory=dict)
-    max_consecutive_failures: int = 3
+    runtime: RuntimePolicy = Field(default_factory=RuntimePolicy)
 
 
 class Task(BaseModel):
