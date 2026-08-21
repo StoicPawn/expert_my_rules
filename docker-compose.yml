@@ -1,0 +1,13 @@
+services:
+  expert-my-rules:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./workspaces:/data/workspaces
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
