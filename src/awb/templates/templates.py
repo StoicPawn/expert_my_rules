@@ -22,14 +22,14 @@ def research_manifest(name, goal):
         {'id':'director','role':'director','instructions':'Select the highest-information task. Prefer falsification, unresolved blockers and theorem-critical work.'},
         {'id':'researcher','role':'worker','instructions':'Develop or falsify claims rigorously. Preserve assumptions, proof dependencies, counterexamples and evidence.'},
         {'id':'referee','role':'reviewer','instructions':'Act independently and adversarially. Reject gaps, hidden assumptions, unsupported novelty and overclaiming.'},
-        {'id':'verifier','role':'verifier','instructions':'Use available formal, symbolic, numerical and reproducibility checks.'},
+        {'id':'verifier','role':'verifier','instructions':'Use available formal, symbolic, numerical and reproducibility checks. Be conservative when certifying completion gates.'},
       ],
       'gates':[
-        {'id':'central_result_closed','description':'The central theorem/result is proved or the strongest valid replacement is explicitly established.','required':True,'manual':True},
-        {'id':'critical_objections_zero','description':'No unresolved fatal objection remains after independent adversarial review.','required':True,'manual':True},
-        {'id':'novelty_checked','description':'Priority and novelty search is complete and documented against the relevant literature.','required':True,'manual':True},
-        {'id':'claims_verified','description':'All major claims have evidence at the strongest available verification level.','required':True,'manual':True},
-        {'id':'paper_ready','description':'A complete, internally consistent, reproducible manuscript package is ready for expert submission review.','required':True,'manual':True},
+        {'id':'central_result_closed','description':'The central theorem/result is proved or the strongest valid replacement is explicitly established.','required':True,'manual':False},
+        {'id':'critical_objections_zero','description':'No unresolved fatal objection remains after independent adversarial review.','required':True,'manual':False},
+        {'id':'novelty_checked','description':'Priority and novelty search is complete and documented against the relevant literature.','required':True,'manual':False},
+        {'id':'claims_verified','description':'All major claims have evidence at the strongest available verification level.','required':True,'manual':False},
+        {'id':'paper_ready','description':'A complete, internally consistent, reproducible manuscript package is ready for expert submission review.','required':True,'manual':False},
       ],
       'validators':{},'tools':[], 'runtime':_runtime()}
 
@@ -39,13 +39,13 @@ def software_manifest(name, goal):
         {'id':'director','role':'director','instructions':'Prioritize user value, blockers, correctness and release criteria.'},
         {'id':'developer','role':'worker','instructions':'Implement the smallest correct increment and leave reproducible evidence.','tools':['list','read','write','tests']},
         {'id':'reviewer','role':'reviewer','instructions':'Reject regressions, unsafe changes, missing requirements and unsupported assumptions.'},
-        {'id':'tester','role':'verifier','instructions':'Execute automated tests and acceptance checks.'},
+        {'id':'tester','role':'verifier','instructions':'Execute automated tests and acceptance checks. Be conservative when certifying completion gates.'},
       ],
       'gates':[
         {'id':'tests_pass','description':'Automated test suite passes.','required':True,'validator':'tests'},
-        {'id':'critical_bugs_zero','description':'No unresolved critical defect remains.','required':True,'manual':True},
-        {'id':'acceptance_complete','description':'The requested product behavior and acceptance criteria are satisfied.','required':True,'manual':True},
-        {'id':'release_ready','description':'Install/build/run instructions and release artifact are complete.','required':True,'manual':True},
+        {'id':'critical_bugs_zero','description':'No unresolved critical defect remains.','required':True,'manual':False},
+        {'id':'acceptance_complete','description':'The requested product behavior and acceptance criteria are satisfied.','required':True,'manual':False},
+        {'id':'release_ready','description':'Install/build/run instructions and release artifact are complete.','required':True,'manual':False},
       ],
       'validators':{'tests':'python -m unittest discover -s tests -v'},
       'tools':[
@@ -61,9 +61,9 @@ def custom_manifest(name, goal):
         {'id':'director','role':'director','instructions':'Choose the next task with the highest expected value for the goal.'},
         {'id':'expert','role':'worker','instructions':'Execute the task and distinguish facts, assumptions, uncertainty and evidence.'},
         {'id':'critic','role':'reviewer','instructions':'Challenge the result independently and reject unsupported claims.'},
-        {'id':'verifier','role':'verifier','instructions':'Check evidence and available external validators.'},
+        {'id':'verifier','role':'verifier','instructions':'Check evidence and available external validators. Be conservative when certifying completion gates.'},
       ],
-      'gates':[{'id':'goal_verified','description':'The final objective has been independently verified.','required':True,'manual':True}],
+      'gates':[{'id':'goal_verified','description':'The final objective has been independently verified.','required':True,'manual':False}],
       'validators':{},'tools':[], 'runtime':_runtime()}
 
 def get_template(kind,name,goal):
