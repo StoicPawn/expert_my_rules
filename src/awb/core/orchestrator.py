@@ -15,6 +15,8 @@ GATE_SYSTEM="""You are the independent completion gatekeeper. Evaluate ONE compl
 class Orchestrator:
     def __init__(self, workspace:Workspace, provider:ModelProvider|None=None):
         self.workspace=workspace; self.provider_override=provider; self.ledger=Ledger(workspace.root/'ledger.sqlite3'); self.artifacts=workspace.root/'artifacts'; self.artifacts.mkdir(parents=True,exist_ok=True); self._cloud_calls=0
+        recovered=self.ledger.recover_interrupted_tasks()
+        if recovered: self.ledger.event('interrupted_tasks_recovered',{'task_ids':recovered})
         for gate in workspace.manifest.gates:
             if gate.id not in self.ledger.gate_state(): self.ledger.set_gate(gate.id,False,'not evaluated')
     def _agent(self,role): return next((a for a in self.workspace.manifest.agents if a.role==role),None)
@@ -37,6 +39,16 @@ class Orchestrator:
             self.ledger.event('model_escalated',{'role':role,'task_id':task.id,'from':spec.model_dump(),'to':esc.cloud_provider.model_dump(),'cloud_call':self._cloud_calls,'budget_eur':esc.daily_budget_eur},task.id)
             return make_provider(esc.cloud_provider.kind,esc.cloud_provider.model)
         return make_provider(spec.kind,spec.model)
+    def _call_model(self,role,system,user,task:Task|None=None):
+        provider=self._provider(role,task); started=time.monotonic(); task_id=task.id if task else None
+        self.ledger.event('model_call_started',{'role':role,'provider':type(provider).__name__},task_id)
+        try:
+            result=provider.generate(system,user)
+        except Exception as exc:
+            self.ledger.event('model_call_failed',{'role':role,'error':f'{type(exc).__name__}: {exc}','seconds':round(time.monotonic()-started,3)},task_id)
+            raise
+        self.ledger.event('model_call_finished',{'role':role,'seconds':round(time.monotonic()-started,3),'chars':len(result)},task_id)
+        return result
     def snapshot(self):
         return json.dumps({'goal':self.workspace.manifest.goal,'description':self.workspace.manifest.description,'tasks':[t.model_dump(mode='json') for t in self.ledger.list_tasks()][-40:],'gates':self.ledger.gate_state(),'recent_events':self.ledger.recent_events(30)},indent=2)
     def choose_next_task(self):
@@ -44,16 +56,16 @@ class Orchestrator:
         if existing: return existing[0]
         context=self.snapshot(); blocked=self.ledger.list_tasks([TaskStatus.BLOCKED])
         if blocked: context+='\nBLOCKED TASKS REQUIRE REMEDIATION:\n'+json.dumps([t.model_dump(mode='json') for t in blocked[:10]],indent=2)
-        raw=self._provider('director').generate(DIRECTOR_SYSTEM+'\n'+self._instructions('director'),context)
+        raw=self._call_model('director',DIRECTOR_SYSTEM+'\n'+self._instructions('director'),context)
         try:d=json.loads(raw)
         except json.JSONDecodeError:d={'title':'Resolve next project gap','description':raw,'priority':1.0}
         task=Task(id=f'TASK-{uuid.uuid4().hex[:8].upper()}',title=str(d.get('title','Next task')),description=str(d.get('description','Advance the project goal.')),priority=float(d.get('priority',1.0)),created_by='director'); self.ledger.upsert_task(task); self.ledger.event('task_created',task.model_dump(mode='json'),task.id); return task
     def _worker_with_tools(self,task,system,prompt):
-        agent=self._agent('worker'); allowed=agent.tools if agent else []; runner=ToolRunner(self.workspace); desc=runner.describe(allowed); provider=self._provider('worker',task)
-        if not desc: return provider.generate(system,prompt)
+        agent=self._agent('worker'); allowed=agent.tools if agent else []; runner=ToolRunner(self.workspace); desc=runner.describe(allowed)
+        if not desc: return self._call_model('worker',system,prompt,task)
         system+='\nAVAILABLE TOOLS:\n'+json.dumps(desc,indent=2); conversation=prompt
         for _ in range(self.workspace.manifest.runtime.max_tool_calls_per_task+1):
-            raw=provider.generate(system,conversation); parsed=parse_tool_message(raw)
+            raw=self._call_model('worker',system,conversation,task); parsed=parse_tool_message(raw)
             if not parsed:return raw
             tool_id,args=parsed
             try: result=runner.execute(tool_id,args) if tool_id in allowed else {'ok':False,'error':f'Tool not allowed: {tool_id}'}
@@ -75,7 +87,7 @@ class Orchestrator:
                 proc=subprocess.run(self.workspace.manifest.validators[gate.validator],cwd=self.workspace.root,shell=True,text=True,capture_output=True); self.ledger.set_gate(gate.id,proc.returncode==0,(proc.stdout+'\n'+proc.stderr).strip()[-3000:]); continue
             if gate.manual or not done: continue
             prompt=f'NORTH STAR:\n{self.workspace.manifest.goal}\n\nGATE:\n{gate.id}: {gate.description}\n\nPROJECT EVIDENCE:\n{self.snapshot()}'
-            raw=self._provider('verifier').generate(GATE_SYSTEM+'\n'+self._instructions('verifier'),prompt)
+            raw=self._call_model('verifier',GATE_SYSTEM+'\n'+self._instructions('verifier'),prompt)
             try:
                 d=json.loads(raw); passed=bool(d.get('passed',False)); detail=str(d.get('detail',''))
             except Exception:
@@ -88,16 +100,20 @@ class Orchestrator:
         ts=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'); path=self.artifacts/f'{ts}_{task.id}.md'; path.write_text(f'# {task.title}\n\n**Task:** {task.description}\n\n## Candidate result\n\n{output}\n\n## Adversarial review\n\nApproved: **{review.approved}**\n\nCritical objections: {json.dumps(review.critical_objections,indent=2)}\n\nRecommendations: {json.dumps(review.recommendations,indent=2)}\n\n## External verification\n\n{verification}\n'); return path
     def step(self):
         task=self.choose_next_task(); attempts=int(task.metadata.get('attempts',0))+1; task.metadata['attempts']=attempts; task.status=TaskStatus.IN_PROGRESS; self.ledger.upsert_task(task); self.ledger.event('task_started',{'attempt':attempts},task.id)
-        output=self._worker_with_tools(task,WORKER_SYSTEM+'\n'+self._instructions('worker'),f'NORTH STAR:\n{self.workspace.manifest.goal}\n\nTASK:\n{task.title}\n{task.description}\n\nSTATE:\n{self.snapshot()}'); self.ledger.event('work_output',{'text':output},task.id)
-        raw=self._provider('reviewer',task).generate(REVIEW_SYSTEM+'\n'+self._instructions('reviewer'),f'NORTH STAR:\n{self.workspace.manifest.goal}\n\nTASK:\n{task.model_dump_json()}\n\nCANDIDATE RESULT:\n{output}')
-        try: review=Review.model_validate(json.loads(raw))
-        except Exception: review=Review(approved=False,critical_objections=['Reviewer returned invalid structured output.'],recommendations=[raw])
-        self.ledger.event('review',review.model_dump(mode='json'),task.id); verified,detail=self.verify(task,output); self.ledger.event('verification',{'passed':verified,'detail':detail},task.id)
-        if review.approved and verified: task.status=TaskStatus.DONE; task.metadata.pop('critical_objections',None)
-        elif attempts>=self.workspace.manifest.runtime.max_task_attempts: task.status=TaskStatus.REJECTED; task.metadata['critical_objections']=review.critical_objections
-        else: task.status=TaskStatus.BLOCKED; task.metadata['critical_objections']=review.critical_objections or [detail]
-        artifact=self._save_artifact(task,output,review,detail); task.metadata['artifact']=str(artifact.relative_to(self.workspace.root)); self.ledger.upsert_task(task); self.evaluate_gates()
-        return IterationResult(task=task,work_output=output,review=review,verification_passed=verified,verification_detail=detail,next_task=None if self.is_complete() else self.choose_next_task())
+        try:
+            output=self._worker_with_tools(task,WORKER_SYSTEM+'\n'+self._instructions('worker'),f'NORTH STAR:\n{self.workspace.manifest.goal}\n\nTASK:\n{task.title}\n{task.description}\n\nSTATE:\n{self.snapshot()}'); self.ledger.event('work_output',{'text':output},task.id)
+            raw=self._call_model('reviewer',REVIEW_SYSTEM+'\n'+self._instructions('reviewer'),f'NORTH STAR:\n{self.workspace.manifest.goal}\n\nTASK:\n{task.model_dump_json()}\n\nCANDIDATE RESULT:\n{output}',task)
+            try: review=Review.model_validate(json.loads(raw))
+            except Exception: review=Review(approved=False,critical_objections=['Reviewer returned invalid structured output.'],recommendations=[raw])
+            self.ledger.event('review',review.model_dump(mode='json'),task.id); verified,detail=self.verify(task,output); self.ledger.event('verification',{'passed':verified,'detail':detail},task.id)
+            if review.approved and verified: task.status=TaskStatus.DONE; task.metadata.pop('critical_objections',None)
+            elif attempts>=self.workspace.manifest.runtime.max_task_attempts: task.status=TaskStatus.REJECTED; task.metadata['critical_objections']=review.critical_objections
+            else: task.status=TaskStatus.BLOCKED; task.metadata['critical_objections']=review.critical_objections or [detail]
+            artifact=self._save_artifact(task,output,review,detail); task.metadata['artifact']=str(artifact.relative_to(self.workspace.root)); self.ledger.upsert_task(task); self.evaluate_gates()
+            return IterationResult(task=task,work_output=output,review=review,verification_passed=verified,verification_detail=detail,next_task=None if self.is_complete() else self.choose_next_task())
+        except Exception as exc:
+            task.status=TaskStatus.BLOCKED; task.metadata['last_error']=f'{type(exc).__name__}: {exc}'; self.ledger.upsert_task(task); self.ledger.event('task_failed',{'error':task.metadata['last_error']},task.id)
+            raise
     def run(self,max_steps=None,max_minutes=None,control=None,on_step=None):
         max_steps=max_steps or self.workspace.manifest.runtime.max_steps_per_run; max_minutes=max_minutes if max_minutes is not None else self.workspace.manifest.runtime.max_minutes_per_run; deadline=time.monotonic()+max_minutes*60 if max_minutes and max_minutes>0 else None; results=[]; self.ledger.event('run_started',{'max_steps':max_steps,'max_minutes':max_minutes}); reason=None
         for _ in range(max_steps):
