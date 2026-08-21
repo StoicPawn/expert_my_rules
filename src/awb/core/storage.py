@@ -29,6 +29,17 @@ class Ledger:
             vals=[s.value for s in statuses]; marks=','.join('?' for _ in vals); rows=self.conn.execute(f'SELECT * FROM tasks WHERE status IN ({marks}) ORDER BY priority DESC,created_at ASC',vals).fetchall()
         else: rows=self.conn.execute('SELECT * FROM tasks ORDER BY priority DESC,created_at ASC').fetchall()
         return [self._row_to_task(r) for r in rows]
+    def recover_interrupted_tasks(self):
+        rows=self.conn.execute("SELECT id,metadata_json FROM tasks WHERE status='IN_PROGRESS'").fetchall()
+        recovered=[]
+        for r in rows:
+            metadata=json.loads(r['metadata_json']); metadata['interrupted_recovery_count']=int(metadata.get('interrupted_recovery_count',0))+1
+            self.conn.execute('UPDATE tasks SET status=?,metadata_json=?,updated_at=? WHERE id=?',(TaskStatus.OPEN.value,json.dumps(metadata),self._now(),r['id']))
+            recovered.append(r['id'])
+        if recovered:
+            self.conn.commit()
+            for task_id in recovered: self.event('task_recovered',{'reason':'task was left IN_PROGRESS by an interrupted worker and was reopened'},task_id)
+        return recovered
     def event(self,kind,payload,task_id=None): self.conn.execute('INSERT INTO events(ts,kind,task_id,payload_json) VALUES(?,?,?,?)',(self._now(),kind,task_id,json.dumps(payload))); self.conn.commit()
     def set_gate(self,gate_id,passed,detail=''): self.conn.execute('''INSERT INTO gates(gate_id,passed,detail,updated_at) VALUES(?,?,?,?) ON CONFLICT(gate_id) DO UPDATE SET passed=excluded.passed,detail=excluded.detail,updated_at=excluded.updated_at''',(gate_id,int(passed),detail,self._now())); self.conn.commit()
     def gate_state(self): return {r['gate_id']:{'passed':bool(r['passed']),'detail':r['detail']} for r in self.conn.execute('SELECT * FROM gates').fetchall()}
