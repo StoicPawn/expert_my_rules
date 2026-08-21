@@ -52,7 +52,7 @@ def cmd_job(args):
 def cmd_cloud(args):
     ws=load_workspace(Path(args.workspace)); p=ws.manifest.runtime.escalation; p.enabled=args.enabled; p.daily_budget_eur=args.daily_budget; p.max_cloud_calls_per_run=args.max_calls; p.cloud_provider.kind='openai'; p.cloud_provider.model=args.model; save_manifest(ws); print(json.dumps(p.model_dump(),indent=2))
 def cmd_serve(args):
-    import os, uvicorn; os.environ['AWB_WORKSPACES_DIR']=str(Path(args.workspaces).resolve()); uvicorn.run('awb.web.app:app',host=args.host,port=args.port,reload=False)
+    import os, uvicorn; os.environ['AWB_WORKSPACES_DIR']=str(Path(args.workspaces).resolve()); uvicorn.run('awb.web.live_app:app',host=args.host,port=args.port,reload=False)
 def build_parser():
     p=argparse.ArgumentParser(prog='awb',description='Expert My Rules autonomous workbench'); sub=p.add_subparsers(required=True)
     x=sub.add_parser('create',help='Goal-first workspace creation'); x.add_argument('--goal',required=True); x.add_argument('--name'); x.add_argument('--path'); x.add_argument('--no-ai-plan',action='store_true'); x.set_defaults(func=cmd_create)
