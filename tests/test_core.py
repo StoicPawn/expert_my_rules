@@ -4,6 +4,7 @@ from pathlib import Path
 
 from awb.core.models import JobStatus, TaskStatus
 from awb.core.orchestrator import Orchestrator
+from awb.core.planner import propose_manifest
 from awb.core.storage import Ledger
 from awb.core.workspace import load_workspace, write_workspace
 from awb.core.tools import ToolRunner
@@ -17,9 +18,9 @@ class ToolCallingProvider(ModelProvider):
         self.worker_calls = 0
 
     def generate(self, system: str, user: str) -> str:
-        if "REVIEW_JSON" in system:
+        if "REVIEW_JSON" in system or "adversarial Reviewer" in system:
             return '{"approved": true, "critical_objections": [], "recommendations": []}'
-        if "DIRECTOR_JSON" in system:
+        if "DIRECTOR_JSON" in system or "Director of an autonomous" in system:
             return '{"title":"Next","description":"Continue","priority":1}'
         if "AVAILABLE TOOLS" in system:
             self.worker_calls += 1
@@ -33,8 +34,7 @@ class WorkbenchTests(unittest.TestCase):
     def test_workspace_and_loop_persists_artifact(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "demo"
-            manifest = custom_manifest("demo", "Ship a verified demo")
-            write_workspace(root, manifest)
+            write_workspace(root, custom_manifest("demo", "Ship a verified demo"))
             ws = load_workspace(root)
             orch = Orchestrator(ws, MockProvider())
             result = orch.step()
@@ -75,6 +75,12 @@ class WorkbenchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "demo"
             manifest = custom_manifest("demo", "Create a result")
+            manifest["tools"] = [
+                {"id":"write","type":"write_file","description":"write","writable":True}
+            ]
+            for agent in manifest["agents"]:
+                if agent["role"] == "worker":
+                    agent["tools"] = ["write"]
             write_workspace(root, manifest)
             ws = load_workspace(root)
             ledger = Ledger(root / "ledger.sqlite3")
@@ -89,9 +95,12 @@ class WorkbenchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "demo"
             manifest = custom_manifest("demo", "Use tools")
+            manifest["tools"] = [
+                {"id":"read","type":"read_file","description":"read"},
+                {"id":"write","type":"write_file","description":"write","writable":True},
+            ]
             write_workspace(root, manifest)
-            ws = load_workspace(root)
-            runner = ToolRunner(ws)
+            runner = ToolRunner(load_workspace(root))
             result = runner.execute("write", {"path": "notes/result.md", "content": "evidence"})
             self.assertTrue(result["ok"])
             self.assertEqual(runner.execute("read", {"path": "notes/result.md"})["content"], "evidence")
@@ -109,6 +118,28 @@ class WorkbenchTests(unittest.TestCase):
             reopened = Ledger(root / "ledger.sqlite3").get_job(job_id)
             self.assertEqual(reopened["status"], JobStatus.PAUSED.value)
             self.assertEqual(reopened["steps_done"], 4)
+
+    def test_goal_first_planner_has_safe_local_defaults(self):
+        manifest = propose_manifest(
+            "Obtain a rigorous result ready for an Annals of Probability paper",
+            name="paper_goal",
+            use_local_ai=False,
+        )
+        self.assertEqual(manifest["type"], "research")
+        self.assertEqual(manifest["runtime"]["default_provider"]["kind"], "ollama")
+        self.assertFalse(manifest["runtime"]["escalation"]["enabled"])
+        self.assertEqual(manifest["runtime"]["escalation"]["daily_budget_eur"], 0.0)
+        self.assertGreaterEqual(len(manifest["gates"]), 4)
+
+    def test_continuous_jobs_are_recoverable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "demo"
+            write_workspace(root, custom_manifest("demo", "Keep working until done"))
+            ledger = Ledger(root / "ledger.sqlite3")
+            job_id = ledger.create_job(0, 0, continuous=True)
+            ledger.update_job(job_id, status=JobStatus.RUNNING, detail="active")
+            recovered = Ledger(root / "ledger.sqlite3").recoverable_jobs()
+            self.assertEqual([j["id"] for j in recovered], [job_id])
 
 
 if __name__ == "__main__":
