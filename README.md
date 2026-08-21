@@ -1,31 +1,45 @@
 # Expert My Rules
 
-**Multi-agent experts that keep working until your rules say they’re done.**
+**Tell it what done looks like.**
 
-Expert My Rules is a local-first autonomous project workbench. A workspace declares a stable final objective, expert roles, model providers, validators and completion gates. The runtime then repeats:
+Expert My Rules is a local-first autonomous project workbench. The normal workflow is deliberately simple:
 
-`Director → Worker → Adversarial Reviewer → External Verifier → Ledger → next task`
+1. Give one final goal.
+2. The local planner proposes the project type, expert team and Definition of Done.
+3. Edit those conditions if you want.
+4. Press **Start autonomous project**.
+5. The project keeps taking checkpointed autonomous sessions until every required completion gate passes, or you pause/cancel it.
 
-The same engine supports research, software, data work or custom workflows. It does not trust an LLM claiming that a project is finished: required gates determine completion.
+The core loop is:
 
-## What the MVP can do now
+`Goal → Director → Worker → independent adversarial Reviewer → external verification → persistent ledger → next task`
 
-- Create `research`, `software` or fully `custom` workspaces.
-- Define a North Star objective, agents, instructions, gates and validators per workspace.
-- Use one default model or assign providers/models to individual agents.
-- Run completely locally with Ollama, use a deterministic mock for testing, or optionally call the OpenAI API.
-- Persist tasks, attempts, events, gate state and long-running job state in SQLite.
-- Save every candidate result + adversarial review + verification report as a Markdown artifact.
-- Inject a human task at any moment; user tasks receive high priority.
-- Stop repeated failures after a configurable attempt budget and ask the Director for a remediation task instead of looping forever.
-- Launch a bounded end-of-day session from the CLI **or from the iPad-friendly dashboard**, then pause/resume/cancel it later while the server continues running.
-- Give the Worker explicit tools. Built-in tools can list/read/write workspace files or run a fixed shell command such as tests; tools are deny-by-default and file paths are sandboxed to the workspace.
-- Edit the North Star, agent instructions, per-agent provider/model, agent tool permissions and completion gates directly from the dashboard.
-- Package the service with Docker Compose, or install it as a normal Python CLI on Windows/macOS/Linux.
+The Director may choose new tasks and strategies, but it is explicitly forbidden from weakening the North Star or moving the completion criteria merely to declare success.
 
-## Fastest cross-platform setup: Docker
+## Local-first by default
 
-Requirements: Docker Desktop (Windows/macOS) or Docker Engine + Compose (Linux).
+The default model provider is **Ollama**. Cloud escalation exists in the architecture but is OFF by default:
+
+```yaml
+escalation:
+  enabled: false
+  daily_budget_eur: 0
+  max_cloud_calls_per_run: 0
+```
+
+An OpenAI escalation can occur only if all of these are true:
+
+- escalation is enabled for the workspace;
+- the configured cloud budget is greater than zero;
+- a positive cloud-call cap is configured;
+- `OPENAI_API_KEY` exists in the environment;
+- the task is important enough or has failed locally enough times according to policy.
+
+Therefore a fresh installation makes **zero API calls**. ChatGPT subscriptions are separate from API billing; Expert My Rules never assumes an API entitlement.
+
+## H24 server setup
+
+Docker Compose is the recommended deployment. It starts both Expert My Rules and Ollama, persists workspaces and model files, and restarts services automatically.
 
 ```bash
 git clone https://github.com/StoicPawn/expert_my_rules.git
@@ -33,161 +47,128 @@ cd expert_my_rules
 docker compose up -d --build
 ```
 
-Open `http://localhost:8000`. From an iPad on the same LAN, open `http://<PC-IP>:8000`.
+Pull the local model once:
 
-Workspaces are persisted in `./workspaces`, outside the container. `restart: unless-stopped` makes the service available again after PC/service restarts.
-
-For local Ollama, install Ollama on the host PC and set the workspace provider to `ollama`. Docker is preconfigured to reach the host at `host.docker.internal:11434`.
-
-## Native installation
-
-Requires Python 3.11+.
-
-### Windows
-
-```powershell
-./install.ps1
-.\.venv\Scripts\awb --help
+```bash
+docker compose exec ollama ollama pull qwen3:8b
 ```
 
-### macOS / Linux
+Then open:
+
+- PC: `http://localhost:8000`
+- iPad/another device on the same private network: `http://<SERVER-IP>:8000`
+
+The server can remain online H24. Ollama is a service: it only performs inference when a project asks for it.
+
+## Goal-first creation
+
+From the dashboard, the main creation screen asks essentially one question:
+
+> What must exist when this project is truly finished?
+
+For example:
+
+> Obtain a rigorous, novel result strong enough for a submission-ready Annals of Probability paper.
+
+The local planner infers a research workspace and proposes agents and completion conditions. If Ollama is temporarily unavailable during creation, a deterministic domain template is used instead; project creation never falls back to a paid API.
+
+CLI equivalent:
+
+```bash
+awb create --goal "Obtain a rigorous, novel result strong enough for a submission-ready Annals of Probability paper"
+```
+
+Advanced users can still create explicit templates with `awb init`.
+
+## Definition of Done
+
+Completion is gate-based, not based on an LLM saying `DONE`.
+
+A research workspace typically proposes conditions such as:
+
+- central result proved or strongest valid replacement established;
+- no unresolved fatal adversarial objection;
+- novelty/priority checked against literature;
+- major claims verified at the strongest available level;
+- complete manuscript package ready for expert submission review.
+
+A software workspace typically proposes:
+
+- tests pass;
+- no critical bugs remain;
+- requested acceptance criteria are satisfied;
+- release/install/run package is complete.
+
+You can modify or add gates before launch.
+
+## Continuous autonomous projects
+
+From the UI press **Start autonomous project**, or from the CLI:
+
+```bash
+awb launch workspaces/<project>
+```
+
+A continuous project is split internally into bounded checkpoint sessions. This avoids one unbounded context/run while preserving the project-level rule: **keep working until the required gates pass**.
+
+Continuous job state is persisted in SQLite. The dashboard provides pause, resume and cancel controls. On service startup, running continuous jobs are recovered and resumed.
+
+You can still inject a temporary directive without changing the North Star, e.g.:
+
+> Tonight attack the converse by searching for counterexamples first.
+
+## Model escalation
+
+Local inference is the normal path. A future API budget can be enabled per workspace from the UI or CLI:
+
+```bash
+awb cloud workspaces/<project> \
+  --enabled \
+  --daily-budget 2 \
+  --max-calls 5 \
+  --model gpt-5
+```
+
+With the current default (`enabled=false`, budget `0`, max calls `0`) it cannot escalate.
+
+The router considers cloud escalation only for configured roles and only after sufficient local failures or for high-priority tasks. Every escalation is written into the event ledger.
+
+## Tool Layer
+
+Agents receive capabilities explicitly. Tools are deny-by-default.
+
+Current primitives include:
+
+- workspace file listing;
+- sandboxed file reads;
+- sandboxed file writes;
+- fixed configured shell commands such as tests.
+
+A model cannot invent an arbitrary shell command just because a shell tool exists; the command is configured in the workspace.
+
+## Installation without Docker
+
+Python 3.11+ is supported.
+
+macOS/Linux:
 
 ```bash
 ./install.sh
 . .venv/bin/activate
-awb --help
-```
-
-## The end-of-day workflow
-
-Create a project once:
-
-```bash
-awb init research observable-complexity \
-  --goal "Prove or refute the Observable Dynamic Complexity duality" \
-  --provider ollama --model qwen3:8b
-```
-
-At the end of the day, inject what you want the experts to attack first:
-
-```bash
-awb task-add workspaces/observable-complexity \
-  "Attack the converse direction" \
-  --description "Try first to construct a counterexample; if none survives, isolate sufficient assumptions."
-```
-
-Then launch:
-
-```bash
-awb overnight workspaces/observable-complexity --hours 8
-```
-
-It stops when either all required gates pass, eight hours expire, or the step safety budget is reached. Every iteration remains inspectable the next morning.
-
-You can do the same from the dashboard: open the workspace, add the task, choose the hours and press **Launch in background**. Closing Safari does not stop the server-side run. The job is recorded in `ledger.sqlite3`; from the dashboard you can pause, resume/continue or request cancellation between iterations.
-
-## Providers
-
-### Local / free: Ollama
-
-```bash
-awb provider workspaces/observable-complexity ollama --model qwen3:8b
-```
-
-Ollama itself must be installed and the chosen model downloaded once.
-
-### OpenAI API: optional
-
-```bash
-export OPENAI_API_KEY="..."
-awb provider workspaces/observable-complexity openai --model gpt-5
-```
-
-The API is optional and is billed separately from ChatGPT subscriptions. Keys are read from environment variables and are never stored in `project.yaml`.
-
-## Workspace = rules
-
-`project.yaml` is the portable declaration of a project. It contains:
-
-```yaml
-name: my_project
-type: custom
-goal: A stable, testable final objective
-
-agents:
-  - id: director
-    role: director
-    instructions: Choose the highest-information next task.
-  - id: expert
-    role: worker
-    instructions: Produce evidence, not just plausible prose.
-    provider:
-      kind: ollama
-      model: qwen3:8b
-    tools: [files, read, write]
-  - id: critic
-    role: reviewer
-    instructions: Try to falsify the candidate result.
-
-gates:
-  - id: goal_verified
-    description: Final objective independently verified.
-    required: true
-    manual: true
-
-validators: {}
-
-tools:
-  - id: files
-    type: list_files
-    description: List workspace files
-  - id: read
-    type: read_file
-    description: Read a workspace text file
-  - id: write
-    type: write_file
-    description: Write a workspace text file
-    writable: true
-
-runtime:
-  default_provider:
-    kind: ollama
-    model: qwen3:8b
-  max_steps_per_run: 25
-  max_minutes_per_run: 60
-  max_task_attempts: 3
-  max_tool_calls_per_task: 12
-  pause_seconds: 0
-```
-
-A software workspace can replace manual claims with real validators such as tests, linters or compilers. Its Worker can already modify workspace files and run explicitly configured test commands. Research workspaces can use the same Tool Layer for notes/artifacts; browser/literature retrieval, Lean and symbolic adapters remain the next scientific-tool milestone.
-
-## Useful commands
-
-```bash
-awb status <workspace>
-awb run <workspace> --max-steps 3
-awb overnight <workspace> --hours 8
-awb job <workspace> status
-awb job <workspace> pause
-awb job <workspace> resume
-awb job <workspace> cancel
-awb task-add <workspace> "Task title"
-awb gate <workspace> goal_verified pass --detail "Human review completed"
-awb provider <workspace> ollama --model qwen3:8b
 awb serve --host 0.0.0.0 --port 8000
 ```
 
+Windows PowerShell:
+
+```powershell
+./install.ps1
+.\.venv\Scripts\awb serve --host 0.0.0.0 --port 8000
+```
+
+For native installation, run Ollama separately and point `OLLAMA_BASE_URL` to it.
+
 ## Important boundary
 
-For mathematical novelty, scientific claims, safety-critical software, or other high-stakes outputs, `COMPLETE` means **the configured gates passed**. It is not a substitute for human/domain-expert sign-off. The purpose of the framework is to make the evidence, objections and verification trail much stronger and much harder to hand-wave.
+Expert My Rules can automate research, implementation, criticism and verification workflows, but high-stakes claims remain subject to the strength of the configured validators. In mathematical research, several agreeing LLMs are not a formal proof checker. The system is designed to make unsupported completion difficult and to preserve the complete evidence/objection trail, not to replace external mathematical or scientific validation.
 
-See `ARCHITECTURE.md` for the design and next milestones.
-
-## Remote access without exposing the service publicly
-
-For use away from home, keep AWB on the always-on PC and connect through a private mesh VPN such as Tailscale rather than forwarding port 8000 to the public Internet. See `REMOTE_ACCESS.md`.
-
-## CI / package artifact
-
-GitHub Actions runs the test suite on Python 3.11, 3.12 and 3.13 and builds an installable wheel artifact on every push/PR.
+See `ARCHITECTURE.md` and `REMOTE_ACCESS.md` for architecture and private-network deployment guidance.
