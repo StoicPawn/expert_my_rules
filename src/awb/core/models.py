@@ -14,6 +14,17 @@ class TaskStatus(str, Enum):
     REJECTED = "REJECTED"
 
 
+class JobStatus(str, Enum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    CANCEL_REQUESTED = "CANCEL_REQUESTED"
+    CANCELLED = "CANCELLED"
+    COMPLETE = "COMPLETE"
+    BUDGET_FINISHED = "BUDGET_FINISHED"
+    FAILED = "FAILED"
+
+
 class ProviderSpec(BaseModel):
     kind: str = "mock"
     model: str | None = None
@@ -27,11 +38,22 @@ class Gate(BaseModel):
     manual: bool = False
 
 
+class ToolSpec(BaseModel):
+    id: str
+    type: str
+    description: str = ""
+    command: str | None = None
+    writable: bool = False
+    enabled: bool = True
+    timeout_seconds: int = 120
+
+
 class AgentSpec(BaseModel):
     id: str
     role: str
     instructions: str
     provider: ProviderSpec | None = None
+    tools: list[str] = Field(default_factory=list)
 
 
 class RuntimePolicy(BaseModel):
@@ -39,6 +61,7 @@ class RuntimePolicy(BaseModel):
     max_steps_per_run: int = 25
     max_minutes_per_run: int = 60
     max_task_attempts: int = 3
+    max_tool_calls_per_task: int = 12
     pause_seconds: float = 0.0
 
 
@@ -50,6 +73,7 @@ class ProjectManifest(BaseModel):
     agents: list[AgentSpec]
     gates: list[Gate]
     validators: dict[str, str] = Field(default_factory=dict)
+    tools: list[ToolSpec] = Field(default_factory=list)
     runtime: RuntimePolicy = Field(default_factory=RuntimePolicy)
 
 
