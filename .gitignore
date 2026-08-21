@@ -8,3 +8,7 @@ __pycache__/
 workspaces/*/artifacts/
 workspaces/*/logs/
 .DS_Store
+
+build/
+dist/
+*.egg-info/
