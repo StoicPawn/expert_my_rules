@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from awb.core.models import Task
+from awb.core.models import JobStatus, Task
 from awb.core.orchestrator import Orchestrator
 from awb.core.storage import Ledger
 from awb.core.workspace import load_workspace, save_manifest, write_workspace
@@ -48,9 +48,38 @@ def cmd_run(args):
 def cmd_overnight(args):
     ws = load_workspace(Path(args.workspace))
     orch = Orchestrator(ws, _provider_override(args))
+    ledger = Ledger(ws.root / "ledger.sqlite3")
     max_steps = args.max_steps or max(ws.manifest.runtime.max_steps_per_run, 100)
-    results = orch.run(max_steps=max_steps, max_minutes=args.hours * 60)
+    minutes = max(0.1, args.hours) * 60
+    job_id = ledger.create_job(minutes, max_steps)
+    ledger.update_job(job_id, status=JobStatus.RUNNING, detail="running from CLI")
+
+    def control():
+        current = ledger.get_job(job_id)
+        if current["status"] == JobStatus.PAUSED.value:
+            return "pause"
+        if current["status"] == JobStatus.CANCEL_REQUESTED.value:
+            return "cancel"
+        return "run"
+
+    def on_step(_count, _result):
+        current = ledger.get_job(job_id)
+        ledger.update_job(job_id, steps_done=int(current["steps_done"]) + 1)
+
+    try:
+        results = orch.run(max_steps=max_steps, max_minutes=minutes, control=control, on_step=on_step)
+        current = ledger.get_job(job_id)
+        if current["status"] == JobStatus.CANCEL_REQUESTED.value:
+            ledger.update_job(job_id, status=JobStatus.CANCELLED, detail="cancelled by user")
+        elif orch.is_complete():
+            ledger.update_job(job_id, status=JobStatus.COMPLETE, detail="all required gates passed")
+        else:
+            ledger.update_job(job_id, status=JobStatus.BUDGET_FINISHED, detail="run budget finished")
+    except Exception as exc:
+        ledger.update_job(job_id, status=JobStatus.FAILED, detail=f"{type(exc).__name__}: {exc}")
+        raise
     print(json.dumps({
+        "job_id": job_id,
         "workspace": ws.manifest.name,
         "steps_completed": len(results),
         "complete": orch.is_complete(),
@@ -68,6 +97,7 @@ def cmd_status(args):
         "provider": ws.manifest.runtime.default_provider.model_dump(),
         "tasks": [t.model_dump(mode="json") for t in ledger.list_tasks()],
         "gates": ledger.gate_state(),
+        "jobs": ledger.list_jobs(10),
         "events": ledger.recent_events(20),
     }, indent=2, default=str))
 
@@ -94,6 +124,24 @@ def cmd_gate(args):
         raise SystemExit(f"Unknown gate: {args.gate_id}")
     Ledger(ws.root / "ledger.sqlite3").set_gate(args.gate_id, args.state == "pass", args.detail or "set by user")
     print(f"{args.gate_id}={args.state.upper()}")
+
+
+def cmd_job(args):
+    ws = load_workspace(Path(args.workspace))
+    ledger = Ledger(ws.root / "ledger.sqlite3")
+    job = ledger.get_job(args.job_id) if args.job_id else ledger.latest_job()
+    if not job:
+        raise SystemExit("No job found")
+    if args.action == "status":
+        print(json.dumps(job, indent=2))
+        return
+    mapping = {
+        "pause": JobStatus.PAUSED,
+        "resume": JobStatus.RUNNING,
+        "cancel": JobStatus.CANCEL_REQUESTED,
+    }
+    ledger.update_job(job["id"], status=mapping[args.action], detail=f"{args.action} requested from CLI")
+    print(json.dumps(ledger.get_job(job["id"]), indent=2))
 
 
 def cmd_provider(args):
@@ -158,6 +206,12 @@ def build_parser():
     x.add_argument("state", choices=["pass", "open"])
     x.add_argument("--detail")
     x.set_defaults(func=cmd_gate)
+
+    x = sub.add_parser("job", help="Inspect or control the latest persistent job")
+    x.add_argument("workspace")
+    x.add_argument("action", choices=["status", "pause", "resume", "cancel"])
+    x.add_argument("--job-id")
+    x.set_defaults(func=cmd_job)
 
     x = sub.add_parser("provider", help="Set the default model provider stored in a workspace")
     x.add_argument("workspace")
