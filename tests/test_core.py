@@ -18,6 +18,8 @@ class ToolCallingProvider(ModelProvider):
         self.worker_calls = 0
 
     def generate(self, system: str, user: str) -> str:
+        if "GATE_JSON" in system:
+            return '{"passed": false, "detail": "keep open"}'
         if "REVIEW_JSON" in system or "adversarial Reviewer" in system:
             return '{"approved": true, "critical_objections": [], "recommendations": []}'
         if "DIRECTOR_JSON" in system or "Director of an autonomous" in system:
@@ -52,12 +54,15 @@ class WorkbenchTests(unittest.TestCase):
             manifest["gates"] = [{"id": "tests_pass", "description": "tests", "required": True, "validator": "tests"}]
             write_workspace(root, manifest)
             orch = Orchestrator(load_workspace(root), MockProvider())
+            orch.evaluate_gates()
             self.assertTrue(orch.is_complete())
 
     def test_manual_gate_controls_completion(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "demo"
-            write_workspace(root, custom_manifest("demo", "Finish goal"))
+            manifest = custom_manifest("demo", "Finish goal")
+            manifest["gates"][0]["manual"] = True
+            write_workspace(root, manifest)
             ws = load_workspace(root)
             orch = Orchestrator(ws, MockProvider())
             self.assertFalse(orch.is_complete())
@@ -75,12 +80,9 @@ class WorkbenchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "demo"
             manifest = custom_manifest("demo", "Create a result")
-            manifest["tools"] = [
-                {"id":"write","type":"write_file","description":"write","writable":True}
-            ]
+            manifest["tools"] = [{"id":"write","type":"write_file","description":"write","writable":True}]
             for agent in manifest["agents"]:
-                if agent["role"] == "worker":
-                    agent["tools"] = ["write"]
+                if agent["role"] == "worker": agent["tools"] = ["write"]
             write_workspace(root, manifest)
             ws = load_workspace(root)
             ledger = Ledger(root / "ledger.sqlite3")
@@ -104,8 +106,7 @@ class WorkbenchTests(unittest.TestCase):
             result = runner.execute("write", {"path": "notes/result.md", "content": "evidence"})
             self.assertTrue(result["ok"])
             self.assertEqual(runner.execute("read", {"path": "notes/result.md"})["content"], "evidence")
-            with self.assertRaises(Exception):
-                runner.execute("read", {"path": "../escape.txt"})
+            with self.assertRaises(Exception): runner.execute("read", {"path": "../escape.txt"})
 
     def test_persistent_job_state(self):
         with tempfile.TemporaryDirectory() as td:
@@ -120,16 +121,13 @@ class WorkbenchTests(unittest.TestCase):
             self.assertEqual(reopened["steps_done"], 4)
 
     def test_goal_first_planner_has_safe_local_defaults(self):
-        manifest = propose_manifest(
-            "Obtain a rigorous result ready for an Annals of Probability paper",
-            name="paper_goal",
-            use_local_ai=False,
-        )
+        manifest = propose_manifest("Obtain a rigorous result ready for an Annals of Probability paper", name="paper_goal", use_local_ai=False)
         self.assertEqual(manifest["type"], "research")
         self.assertEqual(manifest["runtime"]["default_provider"]["kind"], "ollama")
         self.assertFalse(manifest["runtime"]["escalation"]["enabled"])
         self.assertEqual(manifest["runtime"]["escalation"]["daily_budget_eur"], 0.0)
         self.assertGreaterEqual(len(manifest["gates"]), 4)
+        self.assertTrue(all(not g["manual"] for g in manifest["gates"]))
 
     def test_continuous_jobs_are_recoverable(self):
         with tempfile.TemporaryDirectory() as td:
