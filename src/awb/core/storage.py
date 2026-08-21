@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from .models import Task, TaskStatus
+from .models import JobStatus, Task, TaskStatus
 
 
 SCHEMA = """
@@ -34,6 +35,16 @@ CREATE TABLE IF NOT EXISTS gates (
     detail TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    requested_minutes REAL NOT NULL,
+    max_steps INTEGER NOT NULL,
+    steps_done INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -41,7 +52,7 @@ class Ledger:
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(db_path), timeout=30)
+        self.conn = sqlite3.connect(str(db_path), timeout=30, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=30000")
         self.conn.row_factory = sqlite3.Row
@@ -101,6 +112,44 @@ class Ledger:
     def gate_state(self) -> dict[str, dict]:
         rows = self.conn.execute("SELECT * FROM gates").fetchall()
         return {r["gate_id"]: {"passed": bool(r["passed"]), "detail": r["detail"]} for r in rows}
+
+    def create_job(self, requested_minutes: float, max_steps: int) -> str:
+        job_id = f"JOB-{uuid.uuid4().hex[:10].upper()}"
+        now = self._now()
+        self.conn.execute(
+            "INSERT INTO jobs(id,status,requested_minutes,max_steps,steps_done,detail,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (job_id, JobStatus.QUEUED.value, requested_minutes, max_steps, 0, "queued", now, now),
+        )
+        self.conn.commit()
+        return job_id
+
+    def update_job(self, job_id: str, *, status: JobStatus | None = None, steps_done: int | None = None, detail: str | None = None) -> None:
+        current = self.get_job(job_id)
+        if not current:
+            raise KeyError(job_id)
+        self.conn.execute(
+            "UPDATE jobs SET status=?, steps_done=?, detail=?, updated_at=? WHERE id=?",
+            (
+                (status or JobStatus(current["status"])).value,
+                current["steps_done"] if steps_done is None else steps_done,
+                current["detail"] if detail is None else detail,
+                self._now(),
+                job_id,
+            ),
+        )
+        self.conn.commit()
+
+    def get_job(self, job_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def latest_job(self) -> dict | None:
+        row = self.conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+    def list_jobs(self, limit: int = 20) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
 
     def recent_events(self, limit: int = 50) -> list[dict]:
         rows = self.conn.execute("SELECT * FROM events ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
