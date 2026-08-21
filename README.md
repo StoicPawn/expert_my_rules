@@ -2,23 +2,57 @@
 
 **Tell it what done looks like.**
 
-Expert My Rules is a local-first autonomous project workbench. The normal workflow is deliberately simple:
+Expert My Rules is a local-first autonomous project workbench. You give a final goal; the system proposes the project type, expert team and Definition of Done; you may edit them; then the project keeps working in checkpointed autonomous sessions until all required completion gates pass, or you pause/cancel it.
 
-1. Give one final goal.
-2. The local planner proposes the project type, expert team and Definition of Done.
-3. Edit those conditions if you want.
-4. Press **Start autonomous project**.
-5. The project keeps taking checkpointed autonomous sessions until every required completion gate passes, or you pause/cancel it.
+Core loop:
 
-The core loop is:
-
-`Goal → Director → Worker → independent adversarial Reviewer → external verification → persistent ledger → next task`
+`Goal → Director → Worker → independent adversarial Reviewer → verification/gatekeeper → persistent ledger → next task`
 
 The Director may choose new tasks and strategies, but it is explicitly forbidden from weakening the North Star or moving the completion criteria merely to declare success.
 
+## Fastest first run on the Acer (recommended)
+
+### 1. Requirements
+
+Install and start:
+
+- Git
+- Docker Desktop on Windows, or Docker Engine + Compose on Linux
+
+You do **not** need Python, Ollama or an OpenAI API account when using the Docker setup. Docker runs both Expert My Rules and Ollama.
+
+### 2. Clone
+
+```powershell
+git clone https://github.com/StoicPawn/expert_my_rules.git
+cd expert_my_rules
+```
+
+### 3. One-command Windows bootstrap
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\first-run.ps1
+```
+
+The script checks Docker, builds/starts the two services, downloads the default local model and verifies that the web UI answers.
+
+macOS/Linux equivalent:
+
+```bash
+chmod +x first-run.sh
+./first-run.sh
+```
+
+### 4. Open the UI
+
+- Acer itself: `http://localhost:8000`
+- iPad/other PC on the same private network: `http://<ACER-IP>:8000`
+
+If the Acer is modest, the first model download and first inference can be slow. This affects model speed/capability, not the project format or orchestration architecture.
+
 ## What runs where
 
-With the recommended Docker setup, the same PC runs two persistent services:
+With Docker Compose, the Acer/server runs two persistent containers:
 
 ```text
 Acer / home server
@@ -28,46 +62,95 @@ Acer / home server
 │  ├─ project ledger / artifacts
 │  └─ model router
 └─ ollama
-   ├─ local LLM server :11434 (internal Docker network)
-   └─ downloaded model weights in a persistent Docker volume
+   ├─ local LLM server :11434 (private Docker network)
+   └─ model weights in a persistent Docker volume
 ```
 
-Expert My Rules sends normal model requests to `http://ollama:11434`. Ollama does **not** continuously generate tokens: it stays available as a service and performs inference only when the planner or an agent asks for it. The model weights are downloaded once and persisted in the `ollama-models` Docker volume.
+Expert My Rules talks to Ollama at `http://ollama:11434`. Ollama is a service, not a continuously running generation job: when no project requests inference it does not keep producing tokens. The iPad/browser is only a client; closing Safari does not stop server-side work.
 
-Your browser or iPad is only a client. Closing Safari does not move the computation to the iPad and does not stop a running server-side project.
+Both services use `restart: unless-stopped` and health checks. Continuous project state is persisted in SQLite and recoverable jobs are resumed when the application service starts again.
 
-## Start on a small Acer now
+## Default local model and a smaller Acer
 
-Yes: the intended first deployment is a normal always-on PC such as an Acer. It is the same complete system, only with a smaller local model and therefore less reasoning speed/capability than a future GPU server.
+The default is:
 
-Recommended first setup:
+```text
+qwen3:8b
+```
+
+To start with another Ollama model, set the environment variable before first run.
+
+Windows PowerShell example:
+
+```powershell
+$env:AWB_LOCAL_MODEL="qwen3:4b"
+$env:AWB_PLANNER_MODEL="qwen3:4b"
+powershell -ExecutionPolicy Bypass -File .\first-run.ps1
+```
+
+Linux/macOS:
 
 ```bash
-git clone https://github.com/StoicPawn/expert_my_rules.git
-cd expert_my_rules
-docker compose up -d --build
-docker compose exec ollama ollama pull qwen3:8b
+export AWB_LOCAL_MODEL=qwen3:4b
+export AWB_PLANNER_MODEL=qwen3:4b
+./first-run.sh
 ```
 
-Then open:
+The exact model you should use depends on the Acer's RAM/VRAM and CPU/GPU. CPU-only inference works but may be slow. Moving later to a larger model does not change existing projects.
 
-- on the Acer: `http://localhost:8000`
-- from an iPad/PC on the same private network: `http://<ACER-IP>:8000`
+## Goal-first project creation
 
-Check the services:
+From the dashboard, the main input is simply:
 
-```bash
-docker compose ps
-docker compose exec ollama ollama list
-```
+> What must exist when this project is truly finished?
 
-The default local model is `qwen3:8b`. If the Acer has limited RAM, use a smaller Ollama model and set `AWB_LOCAL_MODEL` / `AWB_PLANNER_MODEL` accordingly. If it has more RAM or a useful GPU, use a larger model. The application architecture does not change.
+Examples:
 
-Practical hardware rule: the machine must have enough RAM/VRAM for the chosen Ollama model. CPU-only inference works but can be slow. A GPU improves speed substantially; it is not required for the framework itself.
+> Obtain a rigorous, novel result strong enough for a submission-ready Annals of Probability paper.
 
-## Local-first by default
+> Deliver an installable application that performs X, Y and Z, passes its test suite and satisfies these acceptance criteria.
 
-The default model provider is **Ollama**. Cloud escalation exists in the architecture but is OFF by default:
+The local planner proposes:
+
+- workspace type (`research`, `software`, `custom`);
+- agents and their instructions;
+- Definition of Done / completion gates.
+
+You can edit the proposal before launch. If Ollama is temporarily unavailable during creation, a deterministic template is used; project creation never falls back automatically to a paid API.
+
+Then press **Start autonomous project**. The project remains active across bounded checkpoint sessions until all required gates pass or you pause/cancel it.
+
+You can also inject temporary directives without changing the North Star, for example:
+
+> Tonight attack the converse by searching for counterexamples first.
+
+## Completion is gate-based
+
+The system does not finish because an LLM says `DONE`.
+
+A research project may require conditions such as:
+
+- central result proved or strongest valid replacement established;
+- no unresolved fatal adversarial objection;
+- novelty/priority checked against literature;
+- major claims verified at the strongest available level;
+- complete manuscript package ready for expert submission review.
+
+A software project may require:
+
+- requested functionality implemented;
+- tests pass;
+- no critical bugs remain;
+- acceptance criteria satisfied;
+- install/run/release package complete.
+
+Semantic LLM gatekeeping is useful but is not a substitute for stronger validators such as formal proof checking, external literature retrieval or executable tests when those are required.
+
+## API / cloud escalation
+
+Fresh installations make **zero OpenAI API calls**.
+
+Cloud escalation exists in the architecture but defaults to:
 
 ```yaml
 escalation:
@@ -76,156 +159,163 @@ escalation:
   max_cloud_calls_per_run: 0
 ```
 
-An OpenAI escalation can occur only if all of these are true:
+A cloud call is possible only when all relevant conditions hold:
 
-- escalation is enabled for the workspace;
-- the configured cloud budget is greater than zero;
-- a positive cloud-call cap is configured;
-- `OPENAI_API_KEY` exists in the environment;
-- the task is important enough or has failed locally enough times according to policy.
+1. the workspace explicitly enables escalation;
+2. a positive daily monetary budget is configured;
+3. a positive cloud-call cap is configured;
+4. `OPENAI_API_KEY` exists in the server environment;
+5. the routing policy decides the task merits escalation, e.g. repeated local failure or a configured high-priority independent review.
 
-Therefore a fresh installation makes **zero API calls**. ChatGPT subscriptions are separate from API billing; Expert My Rules never assumes an API entitlement.
+Therefore, without an API account/key and positive budget, **the router always stays local**.
 
-### What happens today without an API account
+A ChatGPT subscription is separate from OpenAI API billing.
 
-Nothing special is required. Leave the defaults unchanged. Every planner/Director/Worker/Reviewer/verifier call stays on Ollama. The cloud router exists but cannot activate because its budget and call cap are zero and no API key is required.
-
-### How API escalation works later
-
-When you later create an OpenAI API account, set the key only in the server environment (never in `project.yaml`) and explicitly give the workspace a positive budget/call cap:
+Later, after creating an API account:
 
 ```bash
 export OPENAI_API_KEY="..."
-awb cloud workspaces/<project> \
-  --enabled \
-  --daily-budget 2 \
-  --max-calls 5 \
-  --model gpt-5
+awb cloud workspaces/<project> --enabled --daily-budget 2 --max-calls 5 --model gpt-5
 ```
 
-The router still uses Ollama normally. It may escalate only under the configured policy, for example after repeated local failures or for a high-priority independent review. Every escalation is recorded in the ledger.
+Ollama remains the default path; expensive calls are exceptional and logged in the project ledger.
 
-## H24 server setup
+## H24 usage
 
-Docker Compose is the recommended deployment. It starts both Expert My Rules and Ollama, persists workspaces and model files, and restarts services automatically with `restart: unless-stopped`.
-
-The server can remain online H24. When no project is working, Ollama performs no inference. When you launch or resume a project, the local agents call Ollama on demand.
-
-Workspace state lives under `./workspaces`; local model files live in the persistent `ollama-models` Docker volume. Rebuilding the application container therefore does not erase your projects or downloaded Ollama models.
-
-## Scale later without changing projects
-
-The deployment is deliberately portable. A project contains its goal, proposed team, gates, ledger and artifacts independently from the machine that executes it.
-
-### Stage 1 — small Acer
+The intended deployment is an always-on Acer/home server.
 
 ```text
-iPad/PC → Acer
-          ├─ Expert My Rules
-          └─ Ollama + small/medium local model
+iPad / laptop
+      ↓
+private LAN or VPN
+      ↓
+Acer
+├─ Expert My Rules
+└─ Ollama
 ```
 
-Use this now. It costs no per-token API money and is enough to validate workflows and run lighter autonomous projects.
+You create/inspect projects from the browser and leave the machine doing the work. Do not expose the current dashboard directly to the public Internet; for remote access use a private VPN/network and add authentication/TLS before any public-facing deployment.
+
+## Scaling path
+
+The project format is deliberately machine-independent.
+
+### Stage 1 — Acer now
+
+```text
+iPad → Acer → Expert My Rules + small/medium Ollama model
+```
+
+Zero per-token API cost. Good for validating the framework and running tasks within the local model's capability.
 
 ### Stage 2 — stronger physical server
 
-Move the repo/workspaces to a machine with more RAM and/or a GPU, keep the same Docker architecture and use a stronger Ollama model:
+Move `expert_my_rules` and the `workspaces/` directory to a machine with more RAM and/or GPU. Keep the same Compose architecture, download a stronger Ollama model and continue the same projects.
 
-```text
-iPad/PC → GPU server
-          ├─ Expert My Rules
-          └─ Ollama + larger local model
-```
+### Stage 3 — hybrid
 
-No project format change is required.
-
-### Stage 3 — hybrid local + API
-
-Keep local inference as the default but allow expensive frontier-model calls only when the escalation policy permits them:
+Keep Ollama as default and enable budgeted API escalation only for selected difficult tasks/reviews.
 
 ```text
                     ┌→ Ollama local (default)
 iPad → AWB router ──┤
-                    └→ OpenAI API (rare, budgeted escalation)
+                    └→ OpenAI API (rare, budgeted)
 ```
 
-### Stage 4 — cloud/server migration
+### Stage 4 — cloud/private GPU server
 
-Expert My Rules and/or Ollama can be moved to a private cloud VM/GPU server. The UI remains the same; only deployment URLs, storage and security/network configuration change. Keep the service private or behind VPN/authentication/TLS rather than directly exposing the current trusted-LAN dashboard to the public Internet.
+Run the same containers/storage on a private cloud VM or GPU server. The UI and workspace format remain the same; networking, security and storage become production-grade.
 
-## Goal-first creation
+## Data and persistence
 
-From the dashboard, the main creation screen asks essentially one question:
+Important state is separated from the application container:
 
-> What must exist when this project is truly finished?
+- `./workspaces/` — project manifests, SQLite ledgers, artifacts and logs;
+- Docker volume `ollama-models` — downloaded local LLM weights.
 
-For example:
+Rebuilding/updating the application container does not delete either location.
 
-> Obtain a rigorous, novel result strong enough for a submission-ready Annals of Probability paper.
+### Backup projects
 
-The local planner infers a research workspace and proposes agents and completion conditions. If Ollama is temporarily unavailable during creation, a deterministic domain template is used instead; project creation never falls back to a paid API.
+The important backup is simply the `workspaces/` directory.
 
-CLI equivalent:
+Before major migrations, stop the stack and copy it:
 
 ```bash
-awb create --goal "Obtain a rigorous, novel result strong enough for a submission-ready Annals of Probability paper"
+docker compose stop
+# copy/archive ./workspaces
+docker compose start
 ```
 
-Advanced users can still create explicit templates with `awb init`.
+Ollama models can always be re-downloaded, so backing up the model volume is optional.
 
-## Definition of Done
+## Updating later
 
-Completion is gate-based, not based on an LLM saying `DONE`.
-
-A research workspace typically proposes conditions such as:
-
-- central result proved or strongest valid replacement established;
-- no unresolved fatal adversarial objection;
-- novelty/priority checked against literature;
-- major claims verified at the strongest available level;
-- complete manuscript package ready for expert submission review.
-
-A software workspace typically proposes:
-
-- tests pass;
-- no critical bugs remain;
-- requested acceptance criteria are satisfied;
-- release/install/run package is complete.
-
-You can modify or add gates before launch.
-
-## Continuous autonomous projects
-
-From the UI press **Start autonomous project**, or from the CLI:
+From the repository directory:
 
 ```bash
-awb launch workspaces/<project>
+git pull
+docker compose up -d --build
 ```
 
-A continuous project is split internally into bounded checkpoint sessions. This avoids one unbounded context/run while preserving the project-level rule: **keep working until the required gates pass**.
+Your workspace directory and model volume remain persistent.
 
-Continuous job state is persisted in SQLite. The dashboard provides pause, resume and cancel controls. On service startup, running continuous jobs are recovered and resumed.
+## Diagnostics
 
-You can still inject a temporary directive without changing the North Star, e.g.:
+Service state:
 
-> Tonight attack the converse by searching for counterexamples first.
+```bash
+docker compose ps
+```
 
-## Tool Layer
+Installed local models:
 
-Agents receive capabilities explicitly. Tools are deny-by-default.
+```bash
+docker compose exec ollama ollama list
+```
 
-Current primitives include:
+Application logs:
 
-- workspace file listing;
-- sandboxed file reads;
-- sandboxed file writes;
-- fixed configured shell commands such as tests.
+```bash
+docker compose logs -f expert-my-rules
+```
 
-A model cannot invent an arbitrary shell command just because a shell tool exists; the command is configured in the workspace.
+Ollama logs:
 
-## Installation without Docker
+```bash
+docker compose logs -f ollama
+```
 
-Python 3.11+ is supported.
+Restart:
+
+```bash
+docker compose restart
+```
+
+Stop without deleting data:
+
+```bash
+docker compose stop
+```
+
+Start again:
+
+```bash
+docker compose start
+```
+
+Do **not** use `docker compose down -v` unless you intentionally want to remove persistent Docker volumes, including downloaded Ollama models.
+
+## Native installation (optional)
+
+Docker is the recommended route. A native Python 3.11+ installation is also supported.
+
+Windows:
+
+```powershell
+.\install.ps1
+.\.venv\Scripts\awb serve --host 0.0.0.0 --port 8000
+```
 
 macOS/Linux:
 
@@ -235,17 +325,10 @@ macOS/Linux:
 awb serve --host 0.0.0.0 --port 8000
 ```
 
-Windows PowerShell:
+For native installation you must install/run Ollama separately and configure `OLLAMA_BASE_URL` yourself.
 
-```powershell
-./install.ps1
-.\.venv\Scripts\awb serve --host 0.0.0.0 --port 8000
-```
+## Current validation boundary
 
-For native installation, install/run Ollama separately and point `OLLAMA_BASE_URL` to it. Docker is simpler because the bundled Compose file already connects the two services internally.
+Expert My Rules automates orchestration, persistent research/software work, adversarial review and configured verification. For high-stakes outputs, quality is limited by the validators/tools available to the workspace. Several agreeing LLM agents do not constitute a formal mathematical proof or an exhaustive novelty search. The architecture is designed so stronger adapters—literature retrieval, Lean, SymPy/numerical counterexample search, Git worktrees, browser tests and other domain tools—can be added without changing the goal-first core.
 
-## Important boundary
-
-Expert My Rules can automate research, implementation, criticism and verification workflows, but high-stakes claims remain subject to the strength of the configured validators. In mathematical research, several agreeing LLMs are not a formal proof checker. The system is designed to make unsupported completion difficult and to preserve the complete evidence/objection trail, not to replace external mathematical or scientific validation.
-
-See `ARCHITECTURE.md` and `REMOTE_ACCESS.md` for architecture and private-network deployment guidance.
+See `ARCHITECTURE.md` and `REMOTE_ACCESS.md` for more detail.
