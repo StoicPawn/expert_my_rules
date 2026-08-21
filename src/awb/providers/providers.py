@@ -10,13 +10,13 @@ from .base import ModelProvider
 class MockProvider(ModelProvider):
     """Deterministic provider for smoke tests and offline development."""
     def generate(self, system: str, user: str) -> str:
-        if "DIRECTOR_JSON" in system:
+        if "DIRECTOR_JSON" in system or "Director of an autonomous" in system:
             return json.dumps({
                 "title": "Inspect current highest-priority gap",
                 "description": "Examine the current project state, identify one concrete unresolved gap, and produce evidence that closes or sharpens it.",
                 "priority": 1.0,
             })
-        if "REVIEW_JSON" in system:
+        if "REVIEW_JSON" in system or "adversarial Reviewer" in system:
             return json.dumps({"approved": True, "critical_objections": [], "recommendations": ["Persist evidence and continue to the next unresolved gate."]})
         return "Mock work result: analyzed the assigned task and produced a candidate result for review."
 
