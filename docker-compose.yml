@@ -1,4 +1,10 @@
 services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+
   expert-my-rules:
     build: .
     ports:
@@ -7,7 +13,12 @@ services:
       - ./workspaces:/data/workspaces
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - AWB_LOCAL_MODEL=${AWB_LOCAL_MODEL:-qwen3:8b}
+      - AWB_PLANNER_MODEL=${AWB_PLANNER_MODEL:-qwen3:8b}
+    depends_on:
+      - ollama
     restart: unless-stopped
+
+volumes:
+  ollama-models:
