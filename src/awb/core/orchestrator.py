@@ -1,16 +1,16 @@
 from __future__ import annotations
 import json, os, subprocess, time, uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from awb.providers.base import ModelProvider
 from awb.providers.providers import make_provider
 from .models import IterationResult, Review, Task, TaskStatus, Workspace
 from .storage import Ledger
 from .tools import ToolRunner, ToolError, parse_tool_message
 
-DIRECTOR_SYSTEM="""You are the Director of an autonomous project workbench. Choose exactly ONE next task that maximally advances the north-star goal. Prefer falsification, blockers, failed gates and high-information work over cosmetics. Never redefine the goal or weaken completion criteria merely to finish. Return JSON only with: title, description, priority."""
+DIRECTOR_SYSTEM="""You are the Director of an autonomous project workbench. Choose exactly ONE next task that maximally advances the north-star goal. Prefer falsification, blockers, failed gates and high-information work over cosmetics. Never redefine the goal or weaken completion criteria merely to finish. Return DIRECTOR_JSON only as JSON with: title, description, priority."""
 WORKER_SYSTEM="""You are the Worker. Execute the assigned task rigorously. Produce inspectable evidence. Separate evidence, assumptions, uncertainty and conclusions. When tools are available you may call them by returning only {\"tool\":\"tool_id\",\"arguments\":{...}}. Never invent tool results."""
-REVIEW_SYSTEM="""You are an independent adversarial Reviewer. Try to reject the candidate. Look for logical gaps, missing cases, non-reproducibility, unsafe changes, circular reasoning, goalpost shifting and unsupported novelty. Return JSON only: approved, critical_objections, recommendations."""
+REVIEW_SYSTEM="""You are an independent adversarial Reviewer. Try to reject the candidate. Look for logical gaps, missing cases, non-reproducibility, unsafe changes, circular reasoning, goalpost shifting and unsupported novelty. Return REVIEW_JSON only as JSON: approved, critical_objections, recommendations."""
+GATE_SYSTEM="""You are the independent completion gatekeeper. Evaluate ONE completion condition conservatively from the recorded project evidence. Never pass a gate because progress merely looks promising. Never infer missing literature checks, tests, proofs, artifacts or external verification. If evidence is insufficient, keep it open. Return GATE_JSON only as JSON with: passed (bool), detail (str)."""
 
 class Orchestrator:
     def __init__(self, workspace:Workspace, provider:ModelProvider|None=None):
@@ -38,7 +38,7 @@ class Orchestrator:
             return make_provider(esc.cloud_provider.kind,esc.cloud_provider.model)
         return make_provider(spec.kind,spec.model)
     def snapshot(self):
-        return json.dumps({'goal':self.workspace.manifest.goal,'description':self.workspace.manifest.description,'tasks':[t.model_dump(mode='json') for t in self.ledger.list_tasks()][-40:],'gates':self.ledger.gate_state(),'recent_events':self.ledger.recent_events(20)},indent=2)
+        return json.dumps({'goal':self.workspace.manifest.goal,'description':self.workspace.manifest.description,'tasks':[t.model_dump(mode='json') for t in self.ledger.list_tasks()][-40:],'gates':self.ledger.gate_state(),'recent_events':self.ledger.recent_events(30)},indent=2)
     def choose_next_task(self):
         existing=self.ledger.list_tasks([TaskStatus.OPEN])
         if existing: return existing[0]
@@ -69,12 +69,21 @@ class Orchestrator:
             else: passed.append(name); self.ledger.event('validator_passed',{'name':name,'detail':detail[-1500:]},task.id)
         return (False,'\n\n'.join(failures)) if failures else (True,'Validators passed: '+', '.join(passed))
     def evaluate_gates(self):
+        done=self.ledger.list_tasks([TaskStatus.DONE]); state=self.ledger.gate_state()
         for gate in self.workspace.manifest.gates:
             if gate.validator and gate.validator in self.workspace.manifest.validators:
-                proc=subprocess.run(self.workspace.manifest.validators[gate.validator],cwd=self.workspace.root,shell=True,text=True,capture_output=True); self.ledger.set_gate(gate.id,proc.returncode==0,(proc.stdout+'\n'+proc.stderr).strip()[-3000:])
+                proc=subprocess.run(self.workspace.manifest.validators[gate.validator],cwd=self.workspace.root,shell=True,text=True,capture_output=True); self.ledger.set_gate(gate.id,proc.returncode==0,(proc.stdout+'\n'+proc.stderr).strip()[-3000:]); continue
+            if gate.manual or not done: continue
+            prompt=f'NORTH STAR:\n{self.workspace.manifest.goal}\n\nGATE:\n{gate.id}: {gate.description}\n\nPROJECT EVIDENCE:\n{self.snapshot()}'
+            raw=self._provider('verifier').generate(GATE_SYSTEM+'\n'+self._instructions('verifier'),prompt)
+            try:
+                d=json.loads(raw); passed=bool(d.get('passed',False)); detail=str(d.get('detail',''))
+            except Exception:
+                passed=False; detail='Gatekeeper returned invalid structured output.'
+            self.ledger.set_gate(gate.id,passed,detail); self.ledger.event('gate_evaluated',{'gate':gate.id,'passed':passed,'detail':detail})
         return self.ledger.gate_state()
     def is_complete(self):
-        state=self.evaluate_gates(); required=[g for g in self.workspace.manifest.gates if g.required]; return bool(required) and all(state.get(g.id,{}).get('passed',False) for g in required)
+        state=self.ledger.gate_state(); required=[g for g in self.workspace.manifest.gates if g.required]; return bool(required) and all(state.get(g.id,{}).get('passed',False) for g in required)
     def _save_artifact(self,task,output,review,verification):
         ts=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'); path=self.artifacts/f'{ts}_{task.id}.md'; path.write_text(f'# {task.title}\n\n**Task:** {task.description}\n\n## Candidate result\n\n{output}\n\n## Adversarial review\n\nApproved: **{review.approved}**\n\nCritical objections: {json.dumps(review.critical_objections,indent=2)}\n\nRecommendations: {json.dumps(review.recommendations,indent=2)}\n\n## External verification\n\n{verification}\n'); return path
     def step(self):
@@ -87,7 +96,7 @@ class Orchestrator:
         if review.approved and verified: task.status=TaskStatus.DONE; task.metadata.pop('critical_objections',None)
         elif attempts>=self.workspace.manifest.runtime.max_task_attempts: task.status=TaskStatus.REJECTED; task.metadata['critical_objections']=review.critical_objections
         else: task.status=TaskStatus.BLOCKED; task.metadata['critical_objections']=review.critical_objections or [detail]
-        artifact=self._save_artifact(task,output,review,detail); task.metadata['artifact']=str(artifact.relative_to(self.workspace.root)); self.ledger.upsert_task(task)
+        artifact=self._save_artifact(task,output,review,detail); task.metadata['artifact']=str(artifact.relative_to(self.workspace.root)); self.ledger.upsert_task(task); self.evaluate_gates()
         return IterationResult(task=task,work_output=output,review=review,verification_passed=verified,verification_detail=detail,next_task=None if self.is_complete() else self.choose_next_task())
     def run(self,max_steps=None,max_minutes=None,control=None,on_step=None):
         max_steps=max_steps or self.workspace.manifest.runtime.max_steps_per_run; max_minutes=max_minutes if max_minutes is not None else self.workspace.manifest.runtime.max_minutes_per_run; deadline=time.monotonic()+max_minutes*60 if max_minutes and max_minutes>0 else None; results=[]; self.ledger.event('run_started',{'max_steps':max_steps,'max_minutes':max_minutes}); reason=None
