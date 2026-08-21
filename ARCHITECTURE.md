@@ -7,14 +7,15 @@ The runtime is domain-agnostic. Every workspace is defined by:
 1. **North Star** — a stable final objective.
 2. **Agents** — roles, instructions and optional per-role model providers.
 3. **State** — persistent tasks, attempts, objections, evidence and events.
-4. **Validators** — executable sources of truth outside the language model.
-5. **Gates** — explicit predicates controlling completion.
-6. **Runtime policy** — budgets for steps, time and retries.
+4. **Tools** — explicitly granted actions the Worker may call while solving a task.
+5. **Validators** — executable sources of truth outside the language model.
+6. **Gates** — explicit predicates controlling completion.
+7. **Runtime policy** — budgets for steps, time, tool calls and retries.
 
 ## Autonomous loop
 
 1. The Director selects one high-information task.
-2. The Worker executes it.
+2. The Worker executes it and may enter a bounded tool-call loop. Only tools granted to that Worker are callable; file tools are workspace-sandboxed and shell tools use fixed configured commands.
 3. The Reviewer tries to reject it.
 4. External validators run.
 5. The result and review are written to an immutable-ish artifact file and SQLite event ledger.
@@ -39,7 +40,7 @@ A workspace defines a default provider. Any agent may override it, allowing conf
 Each workspace owns:
 
 - `project.yaml` — portable rules/configuration.
-- `ledger.sqlite3` — task/event/gate runtime state.
+- `ledger.sqlite3` — task/event/gate/job runtime state.
 - `artifacts/` — candidate outputs and review evidence.
 - `logs/` — reserved for service/runtime logs.
 
@@ -52,7 +53,7 @@ Two supported deployment paths:
 - Native Python 3.11+ installation.
 - Docker Compose, persisting `./workspaces` as a host volume.
 
-The FastAPI dashboard is responsive and can be used from iPad on the same LAN. A background executor allows bounded long runs to continue after the browser is closed. The MVP assumes a trusted local network; public Internet exposure must add authentication/TLS before use.
+The FastAPI dashboard is responsive and can be used from iPad on the same LAN. A background executor allows bounded long runs to continue after the browser is closed. Job state is persisted and exposes pause/resume/cancel controls between agent iterations. The MVP assumes a trusted local network; public Internet exposure must add authentication/TLS before use.
 
 ## Safety budgets
 
@@ -65,14 +66,25 @@ Autonomy is always bounded by configured time, step and retry budgets. An `overn
 
 This makes long unattended runs useful without allowing an accidental unbounded API/cost loop.
 
+## Implemented Tool Layer
+
+The Worker uses a small JSON tool protocol. The runtime executes the action, records arguments/results in the event ledger, returns the result to the model and allows another bounded tool call. Current built-in tool types:
+
+- `list_files`
+- `read_file`
+- `write_file` (requires `writable: true`)
+- `shell` with a fixed manifest command
+
+This is intentionally capability-based rather than giving the model unrestricted shell access.
+
 ## Next milestones
 
-1. Background jobs persisted across service restarts with pause/resume/cancel.
-2. Full dashboard editor for agents, provider routing, validators and gates.
+1. Reconcile/recover jobs automatically after a host/service restart.
+2. Dashboard editor for validators and deletion/reordering of agents/gates/tools.
 3. Structured task DAG/dependencies instead of a flat priority queue.
 4. Git worktree/branch-per-task execution for software projects.
-5. Tool adapters: GitHub, browser/literature search, filesystem/code execution.
+5. External tool adapters: GitHub and browser/literature search.
 6. Formal and scientific validators: Lean, SymPy, numerical counterexample search, reproducibility harnesses.
 7. Independent multi-model referee panels and explicit consensus policies.
 8. Cost/token budgets and escalation policy: cheap local → stronger local → cloud.
-9. Authentication and secure remote access beyond the LAN.
+9. Authentication plus secure remote access beyond the LAN.
