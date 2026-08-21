@@ -3,7 +3,7 @@ import json, os, re
 from awb.providers.providers import make_provider
 from awb.templates.templates import get_template
 
-PLANNER_SYSTEM='''You design autonomous project workspaces. Given only a final goal, propose a rigorous project type, team and Definition of Done. Return JSON only with: type (research|software|custom), description, agents (list of id, role, instructions), gates (list of id, description, required, manual). Use only roles director, worker, reviewer, verifier. Completion gates must be objective, hard to game, and together sufficient to represent the requested final result. Never use cloud/API assumptions.'''
+PLANNER_SYSTEM='''You design autonomous project workspaces. Given only a final goal, propose a rigorous project type, team and Definition of Done. Return JSON only with: type (research|software|custom), description, agents (list of id, role, instructions), gates (list of id, description, required, manual). Use only roles director, worker, reviewer, verifier. Completion gates must be objective, hard to game, and together sufficient to represent the requested final result. Prefer manual=false so the independent verifier can evaluate completion autonomously; use manual=true only when the goal explicitly requires a human decision. Never use cloud/API assumptions.'''
 
 def infer_type(goal: str) -> str:
     g=goal.lower()
@@ -34,7 +34,7 @@ def propose_manifest(goal: str, name: str|None=None, use_local_ai: bool=True) ->
         gates=data.get('gates')
         if isinstance(gates,list) and gates:
             valid=[g for g in gates if isinstance(g,dict) and g.get('id') and g.get('description')]
-            if valid: manifest['gates']=[{**g,'required':bool(g.get('required',True)),'manual':bool(g.get('manual',True))} for g in valid]
+            if valid: manifest['gates']=[{**g,'required':bool(g.get('required',True)),'manual':bool(g.get('manual',False))} for g in valid]
     except Exception:
         pass
     return manifest
