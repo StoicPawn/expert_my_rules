@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from awb.core.models import AgentSpec, Gate, JobStatus, ProviderSpec, Task, ToolSpec
+from awb.core.models import Gate, JobStatus, ProviderSpec, Task, ToolSpec
 from awb.core.orchestrator import Orchestrator
 from awb.core.storage import Ledger
 from awb.core.workspace import load_workspace, save_manifest, write_workspace
