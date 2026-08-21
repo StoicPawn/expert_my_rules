@@ -2,12 +2,31 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from awb.core.models import TaskStatus
+from awb.core.models import JobStatus, TaskStatus
 from awb.core.orchestrator import Orchestrator
 from awb.core.storage import Ledger
 from awb.core.workspace import load_workspace, write_workspace
+from awb.core.tools import ToolRunner
 from awb.providers.providers import MockProvider
+from awb.providers.base import ModelProvider
 from awb.templates.templates import custom_manifest, software_manifest
+
+
+class ToolCallingProvider(ModelProvider):
+    def __init__(self):
+        self.worker_calls = 0
+
+    def generate(self, system: str, user: str) -> str:
+        if "REVIEW_JSON" in system:
+            return '{"approved": true, "critical_objections": [], "recommendations": []}'
+        if "DIRECTOR_JSON" in system:
+            return '{"title":"Next","description":"Continue","priority":1}'
+        if "AVAILABLE TOOLS" in system:
+            self.worker_calls += 1
+            if self.worker_calls == 1:
+                return '{"tool":"write","arguments":{"path":"result.txt","content":"created by tool"}}'
+            return "Implemented the requested artifact and verified that it was written."
+        return "done"
 
 
 class WorkbenchTests(unittest.TestCase):
@@ -51,6 +70,45 @@ class WorkbenchTests(unittest.TestCase):
             write_workspace(root, custom_manifest("demo", "Keep improving"))
             results = Orchestrator(load_workspace(root), MockProvider()).run(max_steps=2, max_minutes=1)
             self.assertEqual(len(results), 2)
+
+    def test_worker_can_call_declared_tools(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "demo"
+            manifest = custom_manifest("demo", "Create a result")
+            write_workspace(root, manifest)
+            ws = load_workspace(root)
+            ledger = Ledger(root / "ledger.sqlite3")
+            from awb.core.models import Task
+            ledger.upsert_task(Task(id="USER-0001", title="Create", description="Create result.txt", priority=10, created_by="user"))
+            provider = ToolCallingProvider()
+            Orchestrator(ws, provider).step()
+            self.assertEqual((root / "result.txt").read_text(), "created by tool")
+            self.assertTrue(any(e["kind"] == "tool_call" for e in ledger.recent_events(30)))
+
+    def test_tool_layer_is_workspace_sandboxed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "demo"
+            manifest = custom_manifest("demo", "Use tools")
+            write_workspace(root, manifest)
+            ws = load_workspace(root)
+            runner = ToolRunner(ws)
+            result = runner.execute("write", {"path": "notes/result.md", "content": "evidence"})
+            self.assertTrue(result["ok"])
+            self.assertEqual(runner.execute("read", {"path": "notes/result.md"})["content"], "evidence")
+            with self.assertRaises(Exception):
+                runner.execute("read", {"path": "../escape.txt"})
+
+    def test_persistent_job_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "demo"
+            write_workspace(root, custom_manifest("demo", "Run later"))
+            ledger = Ledger(root / "ledger.sqlite3")
+            job_id = ledger.create_job(60, 100)
+            self.assertEqual(ledger.get_job(job_id)["status"], JobStatus.QUEUED.value)
+            ledger.update_job(job_id, status=JobStatus.PAUSED, steps_done=4, detail="paused")
+            reopened = Ledger(root / "ledger.sqlite3").get_job(job_id)
+            self.assertEqual(reopened["status"], JobStatus.PAUSED.value)
+            self.assertEqual(reopened["steps_done"], 4)
 
 
 if __name__ == "__main__":
