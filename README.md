@@ -14,11 +14,13 @@ The same engine supports research, software, data work or custom workflows. It d
 - Define a North Star objective, agents, instructions, gates and validators per workspace.
 - Use one default model or assign providers/models to individual agents.
 - Run completely locally with Ollama, use a deterministic mock for testing, or optionally call the OpenAI API.
-- Persist tasks, attempts, events and gate state in SQLite.
+- Persist tasks, attempts, events, gate state and long-running job state in SQLite.
 - Save every candidate result + adversarial review + verification report as a Markdown artifact.
 - Inject a human task at any moment; user tasks receive high priority.
 - Stop repeated failures after a configurable attempt budget and ask the Director for a remediation task instead of looping forever.
-- Launch a bounded end-of-day session from the CLI **or from the iPad-friendly dashboard**, then close the page while the server continues running.
+- Launch a bounded end-of-day session from the CLI **or from the iPad-friendly dashboard**, then pause/resume/cancel it later while the server continues running.
+- Give the Worker explicit tools. Built-in tools can list/read/write workspace files or run a fixed shell command such as tests; tools are deny-by-default and file paths are sandboxed to the workspace.
+- Edit the North Star, agent instructions, per-agent provider/model, agent tool permissions and completion gates directly from the dashboard.
 - Package the service with Docker Compose, or install it as a normal Python CLI on Windows/macOS/Linux.
 
 ## Fastest cross-platform setup: Docker
@@ -82,7 +84,7 @@ awb overnight workspaces/observable-complexity --hours 8
 
 It stops when either all required gates pass, eight hours expire, or the step safety budget is reached. Every iteration remains inspectable the next morning.
 
-You can do the same from the dashboard: open the workspace, add the task, choose the hours and press **Launch in background**. Closing Safari does not stop the server-side run.
+You can do the same from the dashboard: open the workspace, add the task, choose the hours and press **Launch in background**. Closing Safari does not stop the server-side run. The job is recorded in `ledger.sqlite3`; from the dashboard you can pause, resume/continue or request cancellation between iterations.
 
 ## Providers
 
@@ -122,6 +124,7 @@ agents:
     provider:
       kind: ollama
       model: qwen3:8b
+    tools: [files, read, write]
   - id: critic
     role: reviewer
     instructions: Try to falsify the candidate result.
@@ -134,6 +137,18 @@ gates:
 
 validators: {}
 
+tools:
+  - id: files
+    type: list_files
+    description: List workspace files
+  - id: read
+    type: read_file
+    description: Read a workspace text file
+  - id: write
+    type: write_file
+    description: Write a workspace text file
+    writable: true
+
 runtime:
   default_provider:
     kind: ollama
@@ -141,10 +156,11 @@ runtime:
   max_steps_per_run: 25
   max_minutes_per_run: 60
   max_task_attempts: 3
+  max_tool_calls_per_task: 12
   pause_seconds: 0
 ```
 
-A software workspace can replace manual claims with real validators such as tests, linters or compilers. A research workspace can later add literature retrieval, Lean, symbolic checks and reproducibility tests.
+A software workspace can replace manual claims with real validators such as tests, linters or compilers. Its Worker can already modify workspace files and run explicitly configured test commands. Research workspaces can use the same Tool Layer for notes/artifacts; browser/literature retrieval, Lean and symbolic adapters remain the next scientific-tool milestone.
 
 ## Useful commands
 
@@ -152,6 +168,10 @@ A software workspace can replace manual claims with real validators such as test
 awb status <workspace>
 awb run <workspace> --max-steps 3
 awb overnight <workspace> --hours 8
+awb job <workspace> status
+awb job <workspace> pause
+awb job <workspace> resume
+awb job <workspace> cancel
 awb task-add <workspace> "Task title"
 awb gate <workspace> goal_verified pass --detail "Human review completed"
 awb provider <workspace> ollama --model qwen3:8b
@@ -163,3 +183,11 @@ awb serve --host 0.0.0.0 --port 8000
 For mathematical novelty, scientific claims, safety-critical software, or other high-stakes outputs, `COMPLETE` means **the configured gates passed**. It is not a substitute for human/domain-expert sign-off. The purpose of the framework is to make the evidence, objections and verification trail much stronger and much harder to hand-wave.
 
 See `ARCHITECTURE.md` for the design and next milestones.
+
+## Remote access without exposing the service publicly
+
+For use away from home, keep AWB on the always-on PC and connect through a private mesh VPN such as Tailscale rather than forwarding port 8000 to the public Internet. See `REMOTE_ACCESS.md`.
+
+## CI / package artifact
+
+GitHub Actions runs the test suite on Python 3.11, 3.12 and 3.13 and builds an installable wheel artifact on every push/PR.
