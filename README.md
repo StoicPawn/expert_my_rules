@@ -1,79 +1,165 @@
-# Autonomous Workbench (AWB)
+# Expert My Rules
 
-Local-first framework for iterative autonomous work on research, software, data-analysis and custom projects.
+**Multi-agent experts that keep working until your rules say they’re done.**
 
-The core loop is deliberately domain-agnostic:
+Expert My Rules is a local-first autonomous project workbench. A workspace declares a stable final objective, expert roles, model providers, validators and completion gates. The runtime then repeats:
 
-`Goal -> Director -> Worker -> Reviewer -> Verifier -> State update -> next task -> completion gates`
+`Director → Worker → Adversarial Reviewer → External Verifier → Ledger → next task`
 
-The framework does **not** trust an LLM saying that a project is finished. Completion is determined by explicit workspace gates and external validators where available.
+The same engine supports research, software, data work or custom workflows. It does not trust an LLM claiming that a project is finished: required gates determine completion.
 
-## Current MVP
+## What the MVP can do now
 
-- Git-friendly project workspaces with YAML manifests.
-- Persistent SQLite task/decision ledger.
-- Reusable agent roles: director, worker, reviewer, verifier.
-- Model gateway with `mock`, local `ollama`, and optional `openai` providers.
-- Research and software workspace templates.
-- One-step and bounded-loop execution.
-- Minimal web dashboard usable from another device on the LAN, including an iPad.
-- Every iteration persists prompts, outputs, objections and task status.
+- Create `research`, `software` or fully `custom` workspaces.
+- Define a North Star objective, agents, instructions, gates and validators per workspace.
+- Use one default model or assign providers/models to individual agents.
+- Run completely locally with Ollama, use a deterministic mock for testing, or optionally call the OpenAI API.
+- Persist tasks, attempts, events and gate state in SQLite.
+- Save every candidate result + adversarial review + verification report as a Markdown artifact.
+- Inject a human task at any moment; user tasks receive high priority.
+- Stop repeated failures after a configurable attempt budget and ask the Director for a remediation task instead of looping forever.
+- Launch a bounded end-of-day session from the CLI **or from the iPad-friendly dashboard**, then close the page while the server continues running.
+- Package the service with Docker Compose, or install it as a normal Python CLI on Windows/macOS/Linux.
 
-## Quick start
+## Fastest cross-platform setup: Docker
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
-
-awb init research my-theory --goal "Prove or refute the central conjecture"
-awb run workspaces/my-theory --provider mock --max-steps 3
-awb serve --host 0.0.0.0 --port 8000
-```
-
-Open `http://<PC-IP>:8000` from another device on the same network.
-
-### Ollama
-
-Install and run Ollama separately, then:
+Requirements: Docker Desktop (Windows/macOS) or Docker Engine + Compose (Linux).
 
 ```bash
-awb run workspaces/my-theory --provider ollama --model qwen3:8b --max-steps 10
+git clone https://github.com/StoicPawn/expert_my_rules.git
+cd expert_my_rules
+docker compose up -d --build
 ```
 
-### OpenAI API
+Open `http://localhost:8000`. From an iPad on the same LAN, open `http://<PC-IP>:8000`.
 
-API use is optional and separate from the local-first workflow. Set:
+Workspaces are persisted in `./workspaces`, outside the container. `restart: unless-stopped` makes the service available again after PC/service restarts.
+
+For local Ollama, install Ollama on the host PC and set the workspace provider to `ollama`. Docker is preconfigured to reach the host at `host.docker.internal:11434`.
+
+## Native installation
+
+Requires Python 3.11+.
+
+### Windows
+
+```powershell
+./install.ps1
+.\.venv\Scripts\awb --help
+```
+
+### macOS / Linux
+
+```bash
+./install.sh
+. .venv/bin/activate
+awb --help
+```
+
+## The end-of-day workflow
+
+Create a project once:
+
+```bash
+awb init research observable-complexity \
+  --goal "Prove or refute the Observable Dynamic Complexity duality" \
+  --provider ollama --model qwen3:8b
+```
+
+At the end of the day, inject what you want the experts to attack first:
+
+```bash
+awb task-add workspaces/observable-complexity \
+  "Attack the converse direction" \
+  --description "Try first to construct a counterexample; if none survives, isolate sufficient assumptions."
+```
+
+Then launch:
+
+```bash
+awb overnight workspaces/observable-complexity --hours 8
+```
+
+It stops when either all required gates pass, eight hours expire, or the step safety budget is reached. Every iteration remains inspectable the next morning.
+
+You can do the same from the dashboard: open the workspace, add the task, choose the hours and press **Launch in background**. Closing Safari does not stop the server-side run.
+
+## Providers
+
+### Local / free: Ollama
+
+```bash
+awb provider workspaces/observable-complexity ollama --model qwen3:8b
+```
+
+Ollama itself must be installed and the chosen model downloaded once.
+
+### OpenAI API: optional
 
 ```bash
 export OPENAI_API_KEY="..."
-awb run workspaces/my-theory --provider openai --model gpt-5 --max-steps 5
+awb provider workspaces/observable-complexity openai --model gpt-5
 ```
 
-No API key is stored in project files.
+The API is optional and is billed separately from ChatGPT subscriptions. Keys are read from environment variables and are never stored in `project.yaml`.
 
-## Workspace manifest
+## Workspace = rules
 
-Each workspace owns a `project.yaml` file describing:
+`project.yaml` is the portable declaration of a project. It contains:
 
-- north-star goal;
-- agent roles;
-- completion gates;
-- validator commands;
-- iteration policy.
+```yaml
+name: my_project
+type: custom
+goal: A stable, testable final objective
 
-The same runtime can therefore execute a mathematical research project or a software project without hard-coding either domain into the orchestrator.
+agents:
+  - id: director
+    role: director
+    instructions: Choose the highest-information next task.
+  - id: expert
+    role: worker
+    instructions: Produce evidence, not just plausible prose.
+    provider:
+      kind: ollama
+      model: qwen3:8b
+  - id: critic
+    role: reviewer
+    instructions: Try to falsify the candidate result.
 
-## Safety / correctness principle
+gates:
+  - id: goal_verified
+    description: Final objective independently verified.
+    required: true
+    manual: true
 
-`PAPER_READY`, `RELEASE_READY`, or similar terminal states are candidate states only. For high-stakes claims (e.g. new mathematics), final human/domain-expert review remains mandatory.
+validators: {}
 
-## Roadmap
+runtime:
+  default_provider:
+    kind: ollama
+    model: qwen3:8b
+  max_steps_per_run: 25
+  max_minutes_per_run: 60
+  max_task_attempts: 3
+  pause_seconds: 0
+```
 
-1. Structured task DAG and dependency graph.
-2. Git branch-per-task execution for software projects.
-3. Browser/literature and GitHub tools.
-4. Formal-verification adapters (Lean) and symbolic/numerical validators.
-5. Provider escalation policies: cheap local model -> stronger local -> cloud API.
-6. Multi-model independent referee panels.
-7. Rich iPad-first UI and artifact diff/review.
+A software workspace can replace manual claims with real validators such as tests, linters or compilers. A research workspace can later add literature retrieval, Lean, symbolic checks and reproducibility tests.
+
+## Useful commands
+
+```bash
+awb status <workspace>
+awb run <workspace> --max-steps 3
+awb overnight <workspace> --hours 8
+awb task-add <workspace> "Task title"
+awb gate <workspace> goal_verified pass --detail "Human review completed"
+awb provider <workspace> ollama --model qwen3:8b
+awb serve --host 0.0.0.0 --port 8000
+```
+
+## Important boundary
+
+For mathematical novelty, scientific claims, safety-critical software, or other high-stakes outputs, `COMPLETE` means **the configured gates passed**. It is not a substitute for human/domain-expert sign-off. The purpose of the framework is to make the evidence, objections and verification trail much stronger and much harder to hand-wave.
+
+See `ARCHITECTURE.md` for the design and next milestones.
