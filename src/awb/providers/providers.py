@@ -72,7 +72,7 @@ def make_provider(kind: str, model: str | None = None) -> ModelProvider:
     if kind == "mock":
         return MockProvider()
     if kind == "ollama":
-        return OllamaProvider(model or "qwen3:8b")
+        return OllamaProvider(model or "qwen3:4b")
     if kind == "openai":
         return OpenAIProvider(model or "gpt-5")
     raise ValueError(f"Unknown provider: {kind}")
