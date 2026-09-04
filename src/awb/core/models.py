@@ -25,8 +25,29 @@ class JobStatus(str, Enum):
 
 
 class ProviderSpec(BaseModel):
+    """Legacy/direct provider binding kept for backwards compatibility."""
     kind: str = 'mock'
     model: str | None = None
+
+
+class ComputeNodeSpec(BaseModel):
+    """A physical or logical inference node that can be swapped without changing agents."""
+    id: str
+    kind: str = 'ollama'
+    base_url: str | None = None
+    base_url_env: str | None = None
+    enabled: bool = True
+    max_concurrency: int = 1
+    priority: int = 100
+    tags: list[str] = Field(default_factory=list)
+
+
+class ModelRouteSpec(BaseModel):
+    """Route one epistemic role to a model on a compute node."""
+    node: str
+    model: str | None = None
+    priority: int = 100
+    enabled: bool = True
 
 
 class EscalationPolicy(BaseModel):
@@ -66,7 +87,11 @@ class AgentSpec(BaseModel):
 
 
 class RuntimePolicy(BaseModel):
+    # Legacy provider remains valid for every existing workspace.
     default_provider: ProviderSpec = Field(default_factory=lambda: ProviderSpec(kind='ollama', model='qwen3:4b'))
+    # v0.3 scalable runtime. Empty values mean "use the legacy provider path".
+    compute_nodes: list[ComputeNodeSpec] = Field(default_factory=list)
+    role_routes: dict[str, list[ModelRouteSpec]] = Field(default_factory=dict)
     escalation: EscalationPolicy = Field(default_factory=EscalationPolicy)
     max_steps_per_run: int = 25
     max_minutes_per_run: int = 60

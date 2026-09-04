@@ -42,10 +42,10 @@ class OllamaProvider(ModelProvider):
 
 
 class OpenAIProvider(ModelProvider):
-    def __init__(self, model: str, api_key: str | None = None, base_url: str = "https://api.openai.com/v1"):
+    def __init__(self, model: str, api_key: str | None = None, base_url: str | None = None):
         self.model = model
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self.base_url = base_url.rstrip("/")
+        self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is not set")
 
@@ -68,11 +68,11 @@ class OpenAIProvider(ModelProvider):
         return "\n".join(chunks)
 
 
-def make_provider(kind: str, model: str | None = None) -> ModelProvider:
+def make_provider(kind: str, model: str | None = None, base_url: str | None = None) -> ModelProvider:
     if kind == "mock":
         return MockProvider()
     if kind == "ollama":
-        return OllamaProvider(model or "qwen3:4b")
+        return OllamaProvider(model or "qwen3:4b", base_url=base_url)
     if kind == "openai":
-        return OpenAIProvider(model or "gpt-5")
+        return OpenAIProvider(model or "gpt-5", base_url=base_url)
     raise ValueError(f"Unknown provider: {kind}")

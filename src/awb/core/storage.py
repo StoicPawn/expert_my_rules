@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY,title TEXT NOT NULL,descri
 CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT NOT NULL,kind TEXT NOT NULL,task_id TEXT,payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS gates (gate_id TEXT PRIMARY KEY,passed INTEGER NOT NULL DEFAULT 0,detail TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,requested_minutes REAL NOT NULL,max_steps INTEGER NOT NULL,steps_done INTEGER NOT NULL DEFAULT 0,detail TEXT NOT NULL DEFAULT '',continuous INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY,task_id TEXT NOT NULL,attempt_no INTEGER NOT NULL,status TEXT NOT NULL,route_json TEXT NOT NULL DEFAULT '{}',review_json TEXT NOT NULL DEFAULT '{}',verification_json TEXT NOT NULL DEFAULT '{}',artifact TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',started_at TEXT NOT NULL,finished_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id,attempt_no);
 '''
 class Ledger:
     def __init__(self,db_path:Path):
@@ -43,6 +45,22 @@ class Ledger:
     def event(self,kind,payload,task_id=None): self.conn.execute('INSERT INTO events(ts,kind,task_id,payload_json) VALUES(?,?,?,?)',(self._now(),kind,task_id,json.dumps(payload))); self.conn.commit()
     def set_gate(self,gate_id,passed,detail=''): self.conn.execute('''INSERT INTO gates(gate_id,passed,detail,updated_at) VALUES(?,?,?,?) ON CONFLICT(gate_id) DO UPDATE SET passed=excluded.passed,detail=excluded.detail,updated_at=excluded.updated_at''',(gate_id,int(passed),detail,self._now())); self.conn.commit()
     def gate_state(self): return {r['gate_id']:{'passed':bool(r['passed']),'detail':r['detail']} for r in self.conn.execute('SELECT * FROM gates').fetchall()}
+    def start_attempt(self,task_id:str,attempt_no:int):
+        aid=f'ATT-{uuid.uuid4().hex[:10].upper()}'; self.conn.execute('INSERT INTO attempts(id,task_id,attempt_no,status,started_at) VALUES(?,?,?,?,?)',(aid,task_id,attempt_no,'RUNNING',self._now())); self.conn.commit(); return aid
+    def finish_attempt(self,attempt_id:str,*,status:str,route=None,review=None,verification=None,artifact:str='',error:str=''):
+        self.conn.execute('''UPDATE attempts SET status=?,route_json=?,review_json=?,verification_json=?,artifact=?,error=?,finished_at=? WHERE id=?''',(status,json.dumps(route or {}),json.dumps(review or {}),json.dumps(verification or {}),artifact,error,self._now(),attempt_id)); self.conn.commit()
+    def list_attempts(self,task_id:str|None=None,limit:int=100):
+        if task_id:
+            rows=self.conn.execute('SELECT * FROM attempts WHERE task_id=? ORDER BY attempt_no DESC LIMIT ?',(task_id,limit)).fetchall()
+        else:
+            rows=self.conn.execute('SELECT * FROM attempts ORDER BY started_at DESC LIMIT ?',(limit,)).fetchall()
+        out=[]
+        for r in rows:
+            item=dict(r)
+            for key in ('route_json','review_json','verification_json'):
+                item[key[:-5]]=json.loads(item.pop(key) or '{}')
+            out.append(item)
+        return out
     def create_job(self,requested_minutes:float,max_steps:int,continuous:bool=False):
         jid=f'JOB-{uuid.uuid4().hex[:10].upper()}'; now=self._now(); self.conn.execute('INSERT INTO jobs(id,status,requested_minutes,max_steps,steps_done,detail,continuous,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(jid,JobStatus.QUEUED.value,requested_minutes,max_steps,0,'queued',int(continuous),now,now)); self.conn.commit(); return jid
     def update_job(self,job_id,*,status=None,steps_done=None,detail=None):
