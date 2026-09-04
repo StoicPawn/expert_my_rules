@@ -45,8 +45,26 @@ def with_role_providers(agents: list[dict]) -> list[dict]:
 
 
 def _runtime():
+    # The local Acer is now merely the first compute node. A future GPU machine can
+    # be added to compute_nodes and put first in any role route without changing the
+    # agents, workspace format, gates, ledger or orchestration logic.
+    role_routes = {
+        role: [{'node': 'local-ollama', 'model': model_for_role(role), 'priority': 100}]
+        for role in DEFAULT_ROLE_MODELS
+    }
     return {
         'default_provider': provider_for_role('worker'),
+        'compute_nodes': [
+            {
+                'id': 'local-ollama',
+                'kind': 'ollama',
+                'base_url_env': 'OLLAMA_BASE_URL',
+                'max_concurrency': 1,
+                'priority': 100,
+                'tags': ['local', 'small-device'],
+            },
+        ],
+        'role_routes': role_routes,
         'escalation': {
             'enabled': False,
             'cloud_provider': {'kind': 'openai', 'model': 'gpt-5'},
