@@ -67,6 +67,14 @@ class GitWorkspaceManager:
         proc = self._git('rev-parse', '--is-inside-work-tree', cwd=self.root, check=False)
         return proc.returncode == 0 and proc.stdout.strip() == 'true'
 
+    def _assert_workspace_is_repo_root(self) -> None:
+        top = self._git('rev-parse', '--show-toplevel', cwd=self.root).stdout.strip()
+        if Path(top).resolve() != self.root:
+            raise GitWorkspaceError(
+                'Git isolation requires the project workspace itself to be the repository root; '
+                f'found parent repository at {top}. Move the workspace outside that repository or initialize a dedicated repo.'
+            )
+
     def _ensure_identity(self) -> None:
         if self._git('config', '--get', 'user.name', check=False).returncode != 0:
             self._git('config', 'user.name', 'Expert My Rules')
@@ -105,6 +113,7 @@ class GitWorkspaceManager:
             return
         if not self._is_repo():
             self._init_repo()
+        self._assert_workspace_is_repo_root()
         self._ensure_identity()
         self._ensure_runtime_excludes()
         status = self._git('status', '--porcelain').stdout.strip()
@@ -144,6 +153,9 @@ class GitWorkspaceManager:
             if probe.returncode == 0:
                 return GitTaskWorkspace(task_id=task_id, branch=branch, path=path)
             shutil.rmtree(path, ignore_errors=True)
+        # Recover cleanly if a previous process disappeared after removing a path but
+        # before pruning Git's linked-worktree registration.
+        self._git('worktree', 'prune', cwd=self.root, check=False)
         if self._branch_exists(branch):
             self._git('worktree', 'add', str(path), branch)
         else:
