@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS gates (gate_id TEXT PRIMARY KEY,passed INTEGER NOT NU
 CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY,status TEXT NOT NULL,requested_minutes REAL NOT NULL,max_steps INTEGER NOT NULL,steps_done INTEGER NOT NULL DEFAULT 0,detail TEXT NOT NULL DEFAULT '',continuous INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY,task_id TEXT NOT NULL,attempt_no INTEGER NOT NULL,status TEXT NOT NULL,route_json TEXT NOT NULL DEFAULT '{}',review_json TEXT NOT NULL DEFAULT '{}',verification_json TEXT NOT NULL DEFAULT '{}',artifact TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',started_at TEXT NOT NULL,finished_at TEXT);
 CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id,attempt_no);
+CREATE TABLE IF NOT EXISTS model_calls (id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT NOT NULL,task_id TEXT,role TEXT NOT NULL,node TEXT NOT NULL,kind TEXT NOT NULL,model TEXT,source TEXT NOT NULL,success INTEGER NOT NULL,seconds REAL NOT NULL,chars INTEGER NOT NULL DEFAULT 0,error TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS idx_model_calls_route ON model_calls(node,model,role,ts);
 '''
 class Ledger:
     def __init__(self,db_path:Path):
@@ -59,6 +61,22 @@ class Ledger:
             item=dict(r)
             for key in ('route_json','review_json','verification_json'):
                 item[key[:-5]]=json.loads(item.pop(key) or '{}')
+            out.append(item)
+        return out
+    def record_model_call(self,*,task_id=None,role:str,node:str,kind:str,model:str|None,source:str,success:bool,seconds:float,chars:int=0,error:str=''):
+        self.conn.execute('''INSERT INTO model_calls(ts,task_id,role,node,kind,model,source,success,seconds,chars,error) VALUES(?,?,?,?,?,?,?,?,?,?,?)''',(self._now(),task_id,role,node,kind,model,source,int(success),max(0.0,float(seconds)),max(0,int(chars)),error)); self.conn.commit()
+    def recent_model_calls(self,limit:int=100):
+        return [dict(r) for r in self.conn.execute('SELECT * FROM model_calls ORDER BY id DESC LIMIT ?',(limit,)).fetchall()]
+    def model_stats(self):
+        rows=self.conn.execute('''SELECT role,node,kind,model,COUNT(*) AS calls,SUM(success) AS successes,SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failures,AVG(seconds) AS avg_seconds,SUM(seconds) AS total_seconds,SUM(chars) AS total_chars,MAX(ts) AS last_call FROM model_calls GROUP BY role,node,kind,model ORDER BY role,node,model''').fetchall()
+        out=[]
+        for r in rows:
+            item=dict(r)
+            calls=int(item['calls'] or 0); successes=int(item['successes'] or 0); total_seconds=float(item['total_seconds'] or 0.0); total_chars=int(item['total_chars'] or 0)
+            item['success_rate']=round(successes/calls,4) if calls else None
+            item['avg_seconds']=round(float(item['avg_seconds']),3) if item['avg_seconds'] is not None else None
+            item['chars_per_second']=round(total_chars/total_seconds,1) if total_seconds>0 else None
+            item['total_seconds']=round(total_seconds,3)
             out.append(item)
         return out
     def create_job(self,requested_minutes:float,max_steps:int,continuous:bool=False):
