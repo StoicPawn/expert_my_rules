@@ -50,6 +50,36 @@ class ModelRouteSpec(BaseModel):
     enabled: bool = True
 
 
+class WorkflowStageSpec(BaseModel):
+    """One configurable stage in the autonomous project workflow graph."""
+    id: str
+    kind: str
+    role: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
+    validators: list[str] = Field(default_factory=list)
+    enabled: bool = True
+    required: bool = True
+
+
+class WorkflowSpec(BaseModel):
+    """Project-level workflow. Empty stages transparently use the v0.3 legacy loop."""
+    stages: list[WorkflowStageSpec] = Field(default_factory=list)
+    review_policy: str = 'all'
+
+
+class GitIsolationPolicy(BaseModel):
+    """Transactional Git worktree policy for autonomous software changes."""
+    enabled: bool = False
+    auto_init: bool = True
+    checkpoint_dirty: bool = False
+    merge_approved: bool = True
+    discard_rejected: bool = True
+    patch_context_chars: int = 60_000
+    protected_paths: list[str] = Field(default_factory=lambda: [
+        'project.yaml', 'ledger.sqlite3', 'artifacts', 'logs', '.awb', '.git'
+    ])
+
+
 class EscalationPolicy(BaseModel):
     enabled: bool = False
     cloud_provider: ProviderSpec = Field(default_factory=lambda: ProviderSpec(kind='openai', model='gpt-5'))
@@ -92,6 +122,8 @@ class RuntimePolicy(BaseModel):
     # v0.3 scalable runtime. Empty values mean "use the legacy provider path".
     compute_nodes: list[ComputeNodeSpec] = Field(default_factory=list)
     role_routes: dict[str, list[ModelRouteSpec]] = Field(default_factory=dict)
+    # v0.4 transactional software workspace. Disabled by default for old manifests.
+    git: GitIsolationPolicy = Field(default_factory=GitIsolationPolicy)
     escalation: EscalationPolicy = Field(default_factory=EscalationPolicy)
     max_steps_per_run: int = 25
     max_minutes_per_run: int = 60
@@ -109,6 +141,7 @@ class ProjectManifest(BaseModel):
     goal: str
     description: str = ''
     agents: list[AgentSpec]
+    workflow: WorkflowSpec = Field(default_factory=WorkflowSpec)
     gates: list[Gate]
     validators: dict[str, str] = Field(default_factory=dict)
     tools: list[ToolSpec] = Field(default_factory=list)
