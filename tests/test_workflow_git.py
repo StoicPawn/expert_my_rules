@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from awb.core.git_workspace import GitWorkspaceManager
+from awb.core.models import TaskStatus
 from awb.core.orchestrator import Orchestrator
 from awb.core.planner import propose_manifest
 from awb.core.storage import Ledger
@@ -29,6 +30,47 @@ class WorkflowProvider(ModelProvider):
             self.review_systems.append(system)
             return json.dumps({'approved': True, 'critical_objections': [], 'recommendations': []})
         return 'candidate output'
+
+
+class RejectOnceProvider(ModelProvider):
+    def __init__(self):
+        self.reviews = 0
+
+    def generate(self, system: str, user: str) -> str:
+        if 'GATE_JSON' in system:
+            return json.dumps({'passed': False, 'detail': 'keep working'})
+        if 'DIRECTOR_JSON' in system:
+            return json.dumps({'title': 'Retry me', 'description': 'same task', 'priority': 5})
+        if 'REVIEW_JSON' in system:
+            self.reviews += 1
+            approved = self.reviews > 1
+            return json.dumps({
+                'approved': approved,
+                'critical_objections': [] if approved else ['first attempt is insufficient'],
+                'recommendations': [],
+            })
+        return f'candidate attempt {self.reviews + 1}'
+
+
+class SoftwareToolProvider(ModelProvider):
+    def __init__(self):
+        self.worker_calls = 0
+        self.review_prompts = []
+
+    def generate(self, system: str, user: str) -> str:
+        if 'GATE_JSON' in system:
+            return json.dumps({'passed': False, 'detail': 'semantic gates stay open in test'})
+        if 'DIRECTOR_JSON' in system:
+            return json.dumps({'title': 'Change value', 'description': 'set VALUE to 2', 'priority': 10})
+        if 'REVIEW_JSON' in system:
+            self.review_prompts.append(user)
+            return json.dumps({'approved': True, 'critical_objections': [], 'recommendations': []})
+        if 'AVAILABLE TOOLS' in system:
+            self.worker_calls += 1
+            if self.worker_calls == 1:
+                return json.dumps({'tool': 'write', 'arguments': {'path': 'app.py', 'content': 'VALUE = 2\n'}})
+            return 'Implemented VALUE = 2 and left the candidate ready for review.'
+        return 'done'
 
 
 class PlannerProvider(ModelProvider):
@@ -84,6 +126,21 @@ class WorkflowAndGitTests(unittest.TestCase):
             with self.assertRaises(WorkflowConfigurationError):
                 WorkflowGraph(load_workspace(root).manifest)
 
+    def test_rejected_task_is_reopened_and_retried_with_same_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / 'retry'
+            write_workspace(root, custom_manifest('retry', 'finish after critique'))
+            provider = RejectOnceProvider()
+            orch = Orchestrator(load_workspace(root), provider)
+            first = orch.step()
+            self.assertEqual(first.task.status, TaskStatus.BLOCKED)
+            self.assertIsNotNone(first.next_task)
+            self.assertEqual(first.next_task.id, first.task.id)
+            second = orch.step()
+            self.assertEqual(second.task.id, first.task.id)
+            self.assertEqual(second.task.status, TaskStatus.DONE)
+            self.assertEqual(second.task.metadata['attempts'], 2)
+
     @unittest.skipUnless(shutil.which('git'), 'git is required')
     def test_git_worktree_isolates_then_merges_approved_candidate(self):
         with tempfile.TemporaryDirectory() as td:
@@ -122,6 +179,30 @@ class WorkflowAndGitTests(unittest.TestCase):
             manager.discard('TASK-2')
             self.assertEqual((root / 'app.py').read_text(), 'VALUE = 1\n')
             self.assertFalse(task_ws.path.exists())
+
+    @unittest.skipUnless(shutil.which('git'), 'git is required')
+    def test_software_orchestrator_reviews_real_patch_and_merges_only_after_checks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / 'software-e2e'
+            manifest = software_manifest('software-e2e', 'set VALUE to 2')
+            manifest['validators'] = {
+                'lint': 'python -c "print(\'lint ok\')"',
+                'tests': 'python -c "print(\'tests ok\')"',
+            }
+            write_workspace(root, manifest)
+            (root / 'app.py').write_text('VALUE = 1\n')
+            provider = SoftwareToolProvider()
+            result = Orchestrator(load_workspace(root), provider).step()
+            self.assertEqual(result.task.status, TaskStatus.DONE)
+            self.assertTrue(result.verification_passed)
+            self.assertEqual((root / 'app.py').read_text(), 'VALUE = 2\n')
+            self.assertTrue(provider.review_prompts)
+            self.assertIn('ACTUAL GIT PATCH', provider.review_prompts[0])
+            self.assertIn('+VALUE = 2', provider.review_prompts[0])
+            patch_artifact = result.task.metadata.get('patch_artifact')
+            self.assertTrue(patch_artifact)
+            self.assertTrue((root / patch_artifact).exists())
+            self.assertFalse((root / '.awb' / 'worktrees' / result.task.id.lower()).exists())
 
     def test_planner_generated_software_team_keeps_template_tools(self):
         with patch('awb.core.planner.make_provider', return_value=PlannerProvider()):
