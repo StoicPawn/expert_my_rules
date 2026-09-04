@@ -73,6 +73,15 @@ def _runtime():
             },
         ],
         'role_routes': role_routes,
+        'scheduler': {
+            'enabled': True,
+            'queue_timeout_seconds': 120.0,
+            'failure_threshold': 2,
+            'cooldown_seconds': 60.0,
+            'load_penalty': 10,
+            'failure_penalty': 25,
+            'allow_cooldown_probe': True,
+        },
         'git': {'enabled': False},
         'escalation': {
             'enabled': False,

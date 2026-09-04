@@ -59,6 +59,20 @@ class Orchestrator:
     def _route_meta(self,role,node_id,kind,model,source):
         return {'role':role,'node':node_id,'kind':kind,'model':model,'source':source}
 
+    def _persist_model_call(self,meta,task_id,*,success,seconds,chars=0,error=''):
+        self.ledger.record_model_call(
+            task_id=task_id,
+            role=str(meta.get('role') or ''),
+            node=str(meta.get('node') or ''),
+            kind=str(meta.get('kind') or ''),
+            model=meta.get('model'),
+            source=str(meta.get('source') or ''),
+            success=success,
+            seconds=seconds,
+            chars=chars,
+            error=error,
+        )
+
     def _call_model(self,role,system,user,task:Task|None=None):
         task_id=task.id if task else None
         calls=[]
@@ -73,28 +87,54 @@ class Orchestrator:
             calls=[(provider,None,meta)]
         else:
             for route in self.router.candidates(role):
-                calls.append((self.router.provider(route),route,self._route_meta(role,route.node_id,route.kind,route.model,route.source)))
+                # Instantiate the provider lazily inside the protected call below.
+                # A broken provider configuration must be able to fail over too.
+                calls.append((None,route,self._route_meta(role,route.node_id,route.kind,route.model,route.source)))
+        if not calls:
+            raise RuntimeError(f'No healthy model route available for role {role}')
+
         last_exc=None
         for index,(provider,route,meta) in enumerate(calls):
             started=time.monotonic()
             self.ledger.event('model_call_started',meta,task_id)
             try:
+                if provider is None and route is not None:
+                    provider=self.router.provider(route)
                 context=self.router.slot(route) if route is not None else nullcontext()
                 with context:
                     result=provider.generate(system,user)
             except Exception as exc:
                 last_exc=exc
-                self.ledger.event('model_call_failed',{**meta,'error':f'{type(exc).__name__}: {exc}','seconds':round(time.monotonic()-started,3)},task_id)
+                elapsed=time.monotonic()-started
+                error=f'{type(exc).__name__}: {exc}'
+                if route is not None:
+                    self.router.record_failure(route)
+                self._persist_model_call(meta,task_id,success=False,seconds=elapsed,error=error)
+                self._attempt_routes.append({**meta,'success':False,'seconds':round(elapsed,3),'error':error})
+                self.ledger.event('model_call_failed',{**meta,'error':error,'seconds':round(elapsed,3)},task_id)
                 if index+1<len(calls):
                     self.ledger.event('model_route_failover',{'role':role,'failed_node':meta['node'],'next_node':calls[index+1][2]['node']},task_id)
                     continue
                 raise
-            self.ledger.event('model_call_finished',{**meta,'seconds':round(time.monotonic()-started,3),'chars':len(result)},task_id)
-            self._attempt_routes.append(meta)
+            elapsed=time.monotonic()-started
+            chars=len(result)
+            if route is not None:
+                self.router.record_success(route,seconds=elapsed,chars=chars)
+            self._persist_model_call(meta,task_id,success=True,seconds=elapsed,chars=chars)
+            throughput=round(chars/elapsed,1) if elapsed>0 else None
+            call_meta={**meta,'success':True,'seconds':round(elapsed,3),'chars':chars,'chars_per_second':throughput}
+            self.ledger.event('model_call_finished',call_meta,task_id)
+            self._attempt_routes.append(call_meta)
             return result
         if last_exc:
             raise last_exc
         raise RuntimeError(f'No model route available for role {role}')
+
+    def runtime_status(self):
+        return {
+            'nodes': self.router.snapshot(),
+            'historical_model_stats': self.ledger.model_stats(),
+        }
 
     def snapshot(self):
         return json.dumps({
@@ -404,5 +444,5 @@ class Orchestrator:
                 on_step(len(results),result)
             if self.workspace.manifest.runtime.pause_seconds>0:
                 time.sleep(self.workspace.manifest.runtime.pause_seconds)
-        self.ledger.event('run_finished',{'steps':len(results),'complete':self.is_complete(),'reason':reason or 'step_budget','cloud_calls':self._cloud_calls})
+        self.ledger.event('run_finished',{'steps':len(results),'complete':self.is_complete(),'reason':reason or 'step_budget','cloud_calls':self._cloud_calls,'runtime':self.runtime_status()})
         return results

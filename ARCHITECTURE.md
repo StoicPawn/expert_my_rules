@@ -13,6 +13,7 @@ A project consists of:
 5. **Tool capabilities** — explicitly granted, deny-by-default actions.
 6. **Model routing policy** — logical roles are separated from physical compute, with local-first inference and optional budget-gated cloud escalation.
 7. **Transactional software execution** — candidate code changes live in isolated Git worktrees until accepted.
+8. **Adaptive compute safety and telemetry** — bounded node queues, failure cooldown/failover and durable model-call performance history.
 
 ## Goal-first planning
 
@@ -122,15 +123,39 @@ runtime:
       - node: local-ollama
         model: qwen3:4b
         priority: 100
+
+  scheduler:
+    enabled: true
+    queue_timeout_seconds: 120
+    failure_threshold: 2
+    cooldown_seconds: 60
+    load_penalty: 10
+    failure_penalty: 25
 ```
 
-The first enabled route wins. If a routed node fails and another route exists for the same role, the orchestrator fails over to the next one and records the event.
+Explicit route priority remains the primary signal. Within those routes the scheduler can prefer a less-loaded/evidently healthier candidate, bound how long a saturated node may block, temporarily cool down repeatedly failing nodes and fail over to another configured route. If every route is cooling down, one half-open probe is allowed by default so a transient outage cannot permanently strand a role.
 
 This means the same workspace can start on a small CPU machine and later move Worker/Reviewer/Verifier inference to stronger GPU hardware **without changing the North Star, workflow, gates, artifacts or ledger format**.
 
-`max_concurrency` is enforced per compute node inside the running process. The default Acer node is deliberately set to `1`, matching the small-device strategy of keeping inference sequential and allowing Ollama to keep only one model resident at a time.
+`max_concurrency` is enforced per compute node inside the running process. The default Acer node is deliberately set to `1`, matching the small-device strategy of keeping inference sequential and allowing Ollama to keep only one model resident at a time. A future GPU node can advertise a larger concurrency without any agent/workflow change.
 
-Existing v0.2 workspaces that only contain `AgentSpec.provider` / `runtime.default_provider` remain valid. When `compute_nodes` and `role_routes` are absent, routing transparently falls back to the legacy provider path.
+Existing v0.2 workspaces that only contain `AgentSpec.provider` / `runtime.default_provider` remain valid. When `compute_nodes` and `role_routes` are absent, routing transparently falls back to the legacy provider path. Missing `scheduler` configuration is also filled with backwards-compatible defaults.
+
+## Adaptive runtime telemetry
+
+Every model call is durably recorded with:
+
+- task and epistemic role;
+- compute node/provider/model;
+- success/failure;
+- elapsed seconds;
+- output characters and approximate characters/second;
+- error detail for failed calls;
+- timestamp and route source.
+
+This history lives in the workspace ledger rather than only process memory, so restarting the Acer does not erase performance evidence. `awb status <workspace>` reports grouped historical model statistics alongside current node state.
+
+In-process node health is intentionally ephemeral: a restart clears circuit-breaker cooldowns while preserving the factual model-call history. This prevents old transient failures from permanently poisoning a node after recovery.
 
 ## Attempt genealogy
 
@@ -138,13 +163,21 @@ A task is not represented only by its latest state. Every execution attempt has 
 
 - task id and attempt number;
 - final status;
-- model/compute routes actually used;
+- model/compute routes actually used, including failed/failover calls;
 - aggregate and per-stage adversarial review results;
 - verification result;
 - produced artifact and optional patch artifact;
 - runtime error when an attempt fails.
 
 This preserves the correction history needed for long-running autonomous work and makes route-quality scoring, regression analysis and model-specific benchmarking possible without changing the task model.
+
+## Repeatable benchmark plane
+
+Architecture scalability is measurable rather than assumed. `awb benchmark` creates fixed coding workspaces and runs the normal software agent workflow against executable acceptance tests. Each case is isolated, leaves its ledger/Git history/artifacts intact and produces a machine-readable `benchmark.json`.
+
+The built-in suite deliberately removes semantic completion gates from scoring. A case passes only when its acceptance tests pass in the canonical accepted workspace after the normal review/validation/merge path.
+
+The same suite can therefore be run today on the small Acer and later on a GPU workstation. `awb benchmark-compare` compares correctness, elapsed time and model-call counts while the per-case ledgers retain detailed route telemetry. Suite identifiers are versioned so future benchmark expansion does not silently invalidate old baselines.
 
 ## Continuous projects
 
@@ -182,10 +215,12 @@ For software work, tools execute inside the task worktree rather than the accept
 Each workspace owns:
 
 - `project.yaml` — portable goal/team/workflow/gates/tools/runtime policy;
-- `ledger.sqlite3` — tasks, attempts, events, gate state and continuous jobs;
+- `ledger.sqlite3` — tasks, attempts, events, model-call telemetry, gate state and continuous jobs;
 - `artifacts/` — candidate outputs, reviews, verification evidence and patches;
 - `logs/` — runtime/service logs;
 - `.awb/worktrees/` — temporary/retryable software candidate worktrees.
+
+Benchmark runs additionally own a versioned `benchmark.json` summary outside their individual case workspaces.
 
 ## Deployment
 
@@ -203,7 +238,7 @@ The intended scaling path is therefore:
 
 ```text
 small Acer / CPU node
-        ↓ same project/workflow format
+        ↓ same project/workflow format + measurable baseline
 local GPU workstation
         ↓ same project/workflow format
 multiple local/private inference nodes

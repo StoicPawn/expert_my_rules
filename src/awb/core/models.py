@@ -50,6 +50,22 @@ class ModelRouteSpec(BaseModel):
     enabled: bool = True
 
 
+class SchedulerPolicy(BaseModel):
+    """Runtime health/load policy for replaceable inference nodes.
+
+    Priority in role_routes remains the primary routing signal. The scheduler only
+    adds bounded back-pressure and temporary circuit breaking so a dead or saturated
+    node cannot stall an H24 autonomous project indefinitely.
+    """
+    enabled: bool = True
+    queue_timeout_seconds: float = 120.0
+    failure_threshold: int = 2
+    cooldown_seconds: float = 60.0
+    load_penalty: int = 10
+    failure_penalty: int = 25
+    allow_cooldown_probe: bool = True
+
+
 class WorkflowStageSpec(BaseModel):
     """One configurable stage in the autonomous project workflow graph."""
     id: str
@@ -122,6 +138,8 @@ class RuntimePolicy(BaseModel):
     # v0.3 scalable runtime. Empty values mean "use the legacy provider path".
     compute_nodes: list[ComputeNodeSpec] = Field(default_factory=list)
     role_routes: dict[str, list[ModelRouteSpec]] = Field(default_factory=dict)
+    # v0.5 adaptive scheduling. Defaults are safe for existing manifests.
+    scheduler: SchedulerPolicy = Field(default_factory=SchedulerPolicy)
     # v0.4 transactional software workspace. Disabled by default for old manifests.
     git: GitIsolationPolicy = Field(default_factory=GitIsolationPolicy)
     escalation: EscalationPolicy = Field(default_factory=EscalationPolicy)
