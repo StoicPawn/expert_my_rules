@@ -139,7 +139,7 @@ def software_manifest(name, goal):
             'instructions': (
                 'Implement the smallest correct increment. For unfamiliar repositories, map/search first and '
                 'read only the relevant ranges. Prefer exact targeted replacement over rewriting whole existing '
-                'files. Inspect the resulting diff, run lint/tests, and leave reproducible evidence.'
+                'files. Inspect the resulting diff, run the stack-aware lint/tests, and leave reproducible evidence.'
             ),
             'tools': [
                 'repo_map', 'search', 'read_range', 'list', 'read',
@@ -147,7 +147,7 @@ def software_manifest(name, goal):
             ],
         },
         {'id': 'reviewer', 'role': 'reviewer', 'instructions': 'Reject regressions, unsafe changes, missing requirements and unsupported assumptions. Review the actual Git patch, not only the worker narrative.'},
-        {'id': 'tester', 'role': 'verifier', 'instructions': 'Execute automated checks and assess completion evidence conservatively.'},
+        {'id': 'tester', 'role': 'verifier', 'instructions': 'Execute stack-aware automated checks and assess completion evidence conservatively.'},
     ])
     runtime = _runtime()
     runtime['git'] = {
@@ -163,19 +163,19 @@ def software_manifest(name, goal):
         'name': name,
         'type': 'software',
         'goal': goal,
-        'description': 'Autonomous software delivery workspace with transactional Git worktrees and compact repository intelligence.',
+        'description': 'Autonomous software delivery workspace with transactional Git worktrees, compact repository intelligence and stack-aware validation.',
         'agents': agents,
         'workflow': workflow,
         'gates': [
-            {'id': 'lint_pass', 'description': 'Static lint checks pass.', 'required': True, 'validator': 'lint'},
-            {'id': 'tests_pass', 'description': 'Automated test suite passes.', 'required': True, 'validator': 'tests'},
+            {'id': 'lint_pass', 'description': 'Configured/best-available static checks pass for every detected stack.', 'required': True, 'validator': 'lint'},
+            {'id': 'tests_pass', 'description': 'A real test suite is detected and passes for every detected stack; zero-test success is not accepted.', 'required': True, 'validator': 'tests'},
             {'id': 'critical_bugs_zero', 'description': 'No unresolved critical defect remains.', 'required': True, 'manual': False},
             {'id': 'acceptance_complete', 'description': 'The requested product behavior and acceptance criteria are satisfied.', 'required': True, 'manual': False},
             {'id': 'release_ready', 'description': 'Install/build/run instructions and release artifact are complete.', 'required': True, 'manual': False},
         ],
         'validators': {
-            'lint': 'python -m ruff check .',
-            'tests': 'python -m unittest discover -s tests -v',
+            'lint': 'python -m awb.core.validation lint',
+            'tests': 'python -m awb.core.validation tests',
         },
         'tools': [
             {'id': 'repo_map', 'type': 'repo_map', 'description': 'Return a compact repository file map with top-level Python symbols.'},
@@ -187,8 +187,8 @@ def software_manifest(name, goal):
             {'id': 'write', 'type': 'write_file', 'description': 'Create or fully rewrite code/tests in the execution worktree.', 'writable': True},
             {'id': 'git_status', 'type': 'git_status', 'description': 'Inspect the current candidate Git status.'},
             {'id': 'git_diff', 'type': 'git_diff', 'description': 'Inspect the current candidate Git diff.'},
-            {'id': 'lint', 'type': 'shell', 'description': 'Run Ruff static lint checks.', 'command': 'python -m ruff check .'},
-            {'id': 'tests', 'type': 'shell', 'description': 'Run the configured unit tests.', 'command': 'python -m unittest discover -s tests -v'},
+            {'id': 'lint', 'type': 'shell', 'description': 'Run deterministic stack-aware static checks.', 'command': 'python -m awb.core.validation lint'},
+            {'id': 'tests', 'type': 'shell', 'description': 'Detect and run real stack-appropriate tests; fail if no test suite exists.', 'command': 'python -m awb.core.validation tests'},
         ],
         'runtime': runtime,
     }

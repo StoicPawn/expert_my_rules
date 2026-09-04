@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autonomous-workbench"
-version = "0.6.0"
-description = "Local-first autonomous project workbench with adaptive compute routing, configurable agent workflows, transactional Git worktrees, compact repository intelligence and repeatable benchmarks."
+version = "0.7.0"
+description = "Local-first autonomous project workbench with adaptive compute routing, configurable agent workflows, transactional Git worktrees, compact repository intelligence, stack-aware validation and repeatable benchmarks."
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115",
