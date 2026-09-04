@@ -1,10 +1,52 @@
+import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
+from awb.core.orchestrator import Orchestrator
 from awb.core.tools import ToolError, ToolRunner
 from awb.core.workspace import load_workspace, write_workspace
+from awb.providers.base import ModelProvider
 from awb.templates.templates import software_manifest
+
+
+class SurgicalWorkflowProvider(ModelProvider):
+    def __init__(self):
+        self.worker_call = 0
+        self.review_patch_seen = False
+
+    def generate(self, system: str, user: str) -> str:
+        if 'GATE_JSON' in system:
+            return json.dumps({'passed': False, 'detail': 'benchmark does not certify release gates'})
+        if 'REVIEW_JSON' in system:
+            self.review_patch_seen = 'return "hello " + name' in user
+            return json.dumps({
+                'approved': self.review_patch_seen,
+                'critical_objections': [] if self.review_patch_seen else ['expected patch not visible'],
+                'recommendations': [],
+            })
+        if 'DIRECTOR_JSON' in system:
+            return json.dumps({'title': 'Next task', 'description': 'continue', 'priority': 1})
+        self.worker_call += 1
+        sequence = {
+            1: {'tool': 'repo_map', 'arguments': {'max_files': 50}},
+            2: {'tool': 'search', 'arguments': {'query': 'return "bye"'}},
+            3: {'tool': 'read_range', 'arguments': {'path': 'app.py', 'start_line': 1, 'end_line': 5}},
+            4: {
+                'tool': 'replace',
+                'arguments': {
+                    'path': 'app.py',
+                    'old': 'return "bye" + name',
+                    'new': 'return "hello " + name',
+                },
+            },
+            5: {'tool': 'git_diff', 'arguments': {}},
+            6: {'tool': 'tests', 'arguments': {}},
+        }
+        if self.worker_call in sequence:
+            return json.dumps(sequence[self.worker_call])
+        return 'Mapped the repository, located the defect, applied one exact replacement, inspected the diff and passed tests.'
 
 
 class RepositoryIntelligenceTests(unittest.TestCase):
@@ -118,6 +160,31 @@ class RepositoryIntelligenceTests(unittest.TestCase):
             runner = ToolRunner(ws)
             with self.assertRaises(ToolError):
                 runner.execute('read_range', {'path': 'large.py', 'start_line': 1, 'end_line': 600})
+
+    @unittest.skipUnless(shutil.which('git'), 'git is required')
+    def test_repository_tools_work_end_to_end_inside_transactional_worktree(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / 'workspace'
+            write_workspace(root, software_manifest('software', 'fix greeting without weakening tests'))
+            (root / 'app.py').write_text('def greet(name):\n    return "bye" + name\n', encoding='utf-8')
+            (root / 'tests').mkdir()
+            (root / 'tests' / 'test_app.py').write_text(
+                'import unittest\n\nfrom app import greet\n\n\n'
+                'class GreetingTests(unittest.TestCase):\n'
+                '    def test_greeting(self):\n'
+                '        self.assertEqual(greet("Ada"), "hello Ada")\n\n\n'
+                "if __name__ == '__main__':\n"
+                '    unittest.main()\n',
+                encoding='utf-8',
+            )
+            provider = SurgicalWorkflowProvider()
+            result = Orchestrator(load_workspace(root), provider).step()
+            self.assertEqual(result.task.status.value, 'DONE')
+            self.assertTrue(result.review.approved)
+            self.assertTrue(result.verification_passed)
+            self.assertTrue(provider.review_patch_seen)
+            self.assertIn('return "hello " + name', (root / 'app.py').read_text(encoding='utf-8'))
+            self.assertFalse((root / '.awb' / 'worktrees' / result.task.id.lower()).exists())
 
 
 if __name__ == '__main__':
