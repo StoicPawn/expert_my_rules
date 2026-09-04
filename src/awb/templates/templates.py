@@ -133,7 +133,19 @@ def research_manifest(name, goal):
 def software_manifest(name, goal):
     agents = with_role_providers([
         {'id': 'director', 'role': 'director', 'instructions': 'Prioritize user value, blockers, correctness and release criteria.'},
-        {'id': 'developer', 'role': 'worker', 'instructions': 'Implement the smallest correct increment. Inspect diffs, run lint/tests, and leave reproducible evidence.', 'tools': ['list', 'read', 'write', 'git_status', 'git_diff', 'lint', 'tests']},
+        {
+            'id': 'developer',
+            'role': 'worker',
+            'instructions': (
+                'Implement the smallest correct increment. For unfamiliar repositories, map/search first and '
+                'read only the relevant ranges. Prefer exact targeted replacement over rewriting whole existing '
+                'files. Inspect the resulting diff, run lint/tests, and leave reproducible evidence.'
+            ),
+            'tools': [
+                'repo_map', 'search', 'read_range', 'list', 'read',
+                'replace', 'write', 'git_status', 'git_diff', 'lint', 'tests',
+            ],
+        },
         {'id': 'reviewer', 'role': 'reviewer', 'instructions': 'Reject regressions, unsafe changes, missing requirements and unsupported assumptions. Review the actual Git patch, not only the worker narrative.'},
         {'id': 'tester', 'role': 'verifier', 'instructions': 'Execute automated checks and assess completion evidence conservatively.'},
     ])
@@ -151,7 +163,7 @@ def software_manifest(name, goal):
         'name': name,
         'type': 'software',
         'goal': goal,
-        'description': 'Autonomous software delivery workspace with transactional Git worktrees.',
+        'description': 'Autonomous software delivery workspace with transactional Git worktrees and compact repository intelligence.',
         'agents': agents,
         'workflow': workflow,
         'gates': [
@@ -166,9 +178,13 @@ def software_manifest(name, goal):
             'tests': 'python -m unittest discover -s tests -v',
         },
         'tools': [
-            {'id': 'list', 'type': 'list_files', 'description': 'List execution-worktree files.'},
-            {'id': 'read', 'type': 'read_file', 'description': 'Read a file from the execution worktree.'},
-            {'id': 'write', 'type': 'write_file', 'description': 'Write code/tests in the execution worktree.', 'writable': True},
+            {'id': 'repo_map', 'type': 'repo_map', 'description': 'Return a compact repository file map with top-level Python symbols.'},
+            {'id': 'search', 'type': 'search_text', 'description': 'Search literal text across source files and return matching file/line snippets.'},
+            {'id': 'read_range', 'type': 'read_file_range', 'description': 'Read a targeted line range with line numbers instead of loading a whole file.'},
+            {'id': 'list', 'type': 'list_files', 'description': 'List one execution-worktree directory.'},
+            {'id': 'read', 'type': 'read_file', 'description': 'Read a complete execution-worktree file when targeted reading is insufficient.'},
+            {'id': 'replace', 'type': 'replace_text', 'description': 'Perform an exact-count targeted text replacement; refuses ambiguous edits.', 'writable': True},
+            {'id': 'write', 'type': 'write_file', 'description': 'Create or fully rewrite code/tests in the execution worktree.', 'writable': True},
             {'id': 'git_status', 'type': 'git_status', 'description': 'Inspect the current candidate Git status.'},
             {'id': 'git_diff', 'type': 'git_diff', 'description': 'Inspect the current candidate Git diff.'},
             {'id': 'lint', 'type': 'shell', 'description': 'Run Ruff static lint checks.', 'command': 'python -m ruff check .'},
