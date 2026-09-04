@@ -3,11 +3,15 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import BoundedSemaphore
+from threading import BoundedSemaphore, Lock
 
 from awb.providers.base import ModelProvider
 from awb.providers.providers import make_provider
 from .models import ProjectManifest, ProviderSpec
+
+
+_SHARED_SLOTS: dict[str, BoundedSemaphore] = {}
+_SHARED_SLOTS_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -31,10 +35,15 @@ class ModelRouter:
     def __init__(self, manifest: ProjectManifest):
         self.manifest = manifest
         self.nodes = {n.id: n for n in manifest.runtime.compute_nodes if n.enabled}
-        self._slots = {
-            node.id: BoundedSemaphore(max(1, int(node.max_concurrency)))
-            for node in self.nodes.values()
-        }
+        self._slot_keys: dict[str, str] = {}
+        for node in self.nodes.values():
+            base_url = os.getenv(node.base_url_env) if node.base_url_env else None
+            base_url = base_url or node.base_url or 'default'
+            key = f'{node.kind}|{base_url}|{node.id}'
+            self._slot_keys[node.id] = key
+            with _SHARED_SLOTS_LOCK:
+                if key not in _SHARED_SLOTS:
+                    _SHARED_SLOTS[key] = BoundedSemaphore(max(1, int(node.max_concurrency)))
 
     def _agent_provider(self, role: str) -> ProviderSpec:
         agent = next((a for a in self.manifest.agents if a.role == role), None)
@@ -75,7 +84,8 @@ class ModelRouter:
 
     @contextmanager
     def slot(self, route: ResolvedRoute):
-        semaphore = self._slots.get(route.node_id)
+        key = self._slot_keys.get(route.node_id)
+        semaphore = _SHARED_SLOTS.get(key) if key else None
         if semaphore is None:
             yield
             return
