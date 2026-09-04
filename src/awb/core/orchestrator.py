@@ -350,11 +350,12 @@ class Orchestrator:
 
             self.ledger.upsert_task(task)
             self.evaluate_gates()
+            attempt_review={**aggregate_review.model_dump(mode='json'),'stages':review_payload}
             self.ledger.finish_attempt(
                 attempt_id,
                 status=task.status.value,
                 route={'calls':self._attempt_routes},
-                review={'aggregate':aggregate_review.model_dump(mode='json'),'stages':review_payload},
+                review=attempt_review,
                 verification={'passed':verified,'detail':verification_detail},
                 artifact=task.metadata['artifact'],
             )
