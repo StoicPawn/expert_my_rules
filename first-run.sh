@@ -1,6 +1,14 @@
 #!/usr/bin/env sh
 set -eu
 
+# Persist deployment choices in .env so the same machine can later switch from
+# bundled local inference to a remote Ollama worker without moving project state.
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
+
 MODE="${AWB_INFERENCE_MODE:-local}"
 PORT="${AWB_PORT:-8100}"
 
