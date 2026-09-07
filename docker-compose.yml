@@ -1,6 +1,7 @@
 services:
   ollama:
     image: ollama/ollama:latest
+    profiles: ["local-inference"]
     volumes:
       - ollama-models:/root/.ollama
     environment:
@@ -19,22 +20,21 @@ services:
   expert-my-rules:
     build: .
     ports:
-      - "8000:8000"
+      - "${AWB_PORT:-8100}:8000"
     volumes:
       - ./workspaces:/data/workspaces
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OLLAMA_BASE_URL=http://ollama:11434
-      # Heterogeneous local ensemble. Qwen builds; Llama attacks; Gemma checks.
+      # Local mode: http://ollama:11434. Remote mode: point this at a private
+      # LAN/Tailscale Ollama worker, e.g. http://100.x.y.z:11434.
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+      # Heterogeneous local/remote ensemble. Qwen builds; Llama attacks; Gemma checks.
       - AWB_LOCAL_MODEL=${AWB_LOCAL_MODEL:-qwen3:4b}
       - AWB_PLANNER_MODEL=${AWB_PLANNER_MODEL:-qwen3:4b}
       - AWB_DIRECTOR_MODEL=${AWB_DIRECTOR_MODEL:-qwen3:4b}
       - AWB_WORKER_MODEL=${AWB_WORKER_MODEL:-qwen3:4b}
       - AWB_REVIEWER_MODEL=${AWB_REVIEWER_MODEL:-llama3.2:3b}
       - AWB_VERIFIER_MODEL=${AWB_VERIFIER_MODEL:-gemma3:4b}
-    depends_on:
-      ollama:
-        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000', timeout=3)"]
