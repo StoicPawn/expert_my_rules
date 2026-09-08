@@ -27,6 +27,20 @@ class OllamaProvider(ModelProvider):
     def __init__(self, model: str, base_url: str | None = None):
         self.model = model
         self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
+        raw_timeout = os.getenv("AWB_OLLAMA_READ_TIMEOUT_SECONDS", "3600")
+        try:
+            self.read_timeout_seconds = max(60.0, float(raw_timeout))
+        except (TypeError, ValueError):
+            self.read_timeout_seconds = 3600.0
+        # Long local inference calls are expected on small CPU-only machines.
+        # Keep connection/write/pool timeouts bounded while allowing the model
+        # up to an hour (configurable) to finish producing a response.
+        self.timeout = httpx.Timeout(
+            connect=30.0,
+            read=self.read_timeout_seconds,
+            write=60.0,
+            pool=60.0,
+        )
 
     def generate(self, system: str, user: str) -> str:
         r = httpx.post(
@@ -35,7 +49,7 @@ class OllamaProvider(ModelProvider):
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ]},
-            timeout=600,
+            timeout=self.timeout,
         )
         r.raise_for_status()
         return r.json()["message"]["content"]
