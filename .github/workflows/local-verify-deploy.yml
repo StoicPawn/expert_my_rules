@@ -21,7 +21,7 @@ jobs:
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'main')
     runs-on: [self-hosted, linux, expert-local]
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Choose trusted revision
@@ -53,7 +53,7 @@ jobs:
           python -m unittest discover -s tests -v
           docker compose --env-file .env.example config >/dev/null
 
-      - name: Deploy tested main
+      - name: Deploy tested main at a safe checkpoint
         if: github.event_name == 'workflow_run'
         shell: bash
         env:
@@ -63,9 +63,6 @@ jobs:
           test -d "$DEPLOY_DIR/.git"
           test -f "$DEPLOY_DIR/.env"
 
-          # A previous manual chmod of switch-inference.sh can leave the production
-          # checkout dirty even when its bytes are exactly the committed bytes. Heal
-          # only that narrow metadata-only case; never overwrite real local content.
           CHANGED="$(git -C "$DEPLOY_DIR" diff --name-only)"
           if [ "$CHANGED" = "switch-inference.sh" ]; then
             WORKTREE_BLOB="$(git hash-object "$DEPLOY_DIR/switch-inference.sh")"
@@ -90,30 +87,126 @@ jobs:
           cd "$DEPLOY_DIR"
           MODE="$(awk -F= '$1=="AWB_INFERENCE_MODE" {print $2}' .env | tail -n1)"
           MODE="${MODE:-local}"
+          PORT="$(awk -F= '$1=="AWB_PORT" {print $2}' .env | tail -n1)"
+          PORT="${PORT:-8100}"
 
           if [ "$MODE" = "local" ]; then
-            docker compose --env-file .env --profile local-inference up -d --build --remove-orphans
+            docker compose --env-file .env --profile local-inference build expert-my-rules
           elif [ "$MODE" = "remote" ]; then
-            docker compose --env-file .env up -d --build --remove-orphans
+            docker compose --env-file .env build expert-my-rules
           else
             echo "Unsupported AWB_INFERENCE_MODE=$MODE"
             exit 1
           fi
 
-      - name: Health check
-        if: github.event_name == 'workflow_run'
-        shell: bash
-        env:
-          DEPLOY_DIR: /home/stoicpawn/projects/expert_my_rules
-        run: |
-          set -euo pipefail
-          cd "$DEPLOY_DIR"
-          PORT="$(awk -F= '$1=="AWB_PORT" {print $2}' .env | tail -n1)"
-          PORT="${PORT:-8100}"
+          PAUSED_FILE="$RUNNER_TEMP/expert-safe-deploy-paused.tsv"
+          : > "$PAUSED_FILE"
+          export DEPLOY_DIR PAUSED_FILE
+
+          python3 - <<'PY'
+          import os
+          import sqlite3
+          from pathlib import Path
+
+          root = Path(os.environ['DEPLOY_DIR']) / 'workspaces'
+          paused = Path(os.environ['PAUSED_FILE'])
+          count = 0
+          if root.exists():
+              for db in root.glob('*/ledger.sqlite3'):
+                  conn = sqlite3.connect(db, timeout=30)
+                  try:
+                      rows = conn.execute(
+                          "SELECT id FROM jobs WHERE continuous=1 AND status='RUNNING'"
+                      ).fetchall()
+                      for (job_id,) in rows:
+                          conn.execute(
+                              "UPDATE jobs SET status='PAUSED', detail='paused for safe deploy', updated_at=datetime('now') WHERE id=?",
+                              (job_id,),
+                          )
+                          with paused.open('a', encoding='utf-8') as fh:
+                              fh.write(f"{db.parent.name}\t{job_id}\n")
+                          count += 1
+                      conn.commit()
+                  finally:
+                      conn.close()
+          print(f"Safely requested pause for {count} active continuous job(s).")
+          PY
+
+          restore_jobs() {
+            python3 - <<'PY'
+          import os
+          import sqlite3
+          from pathlib import Path
+
+          paused = Path(os.environ['PAUSED_FILE'])
+          root = Path(os.environ['DEPLOY_DIR']) / 'workspaces'
+          if not paused.exists():
+              raise SystemExit(0)
+          for line in paused.read_text(encoding='utf-8').splitlines():
+              if not line.strip():
+                  continue
+              slug, job_id = line.split('\t', 1)
+              db = root / slug / 'ledger.sqlite3'
+              if not db.exists():
+                  continue
+              conn = sqlite3.connect(db, timeout=30)
+              try:
+                  conn.execute(
+                      "UPDATE jobs SET status='RUNNING', detail='recovering after safe deploy', updated_at=datetime('now') WHERE id=? AND status='PAUSED'",
+                      (job_id,),
+                  )
+                  conn.commit()
+              finally:
+                  conn.close()
+          PY
+          }
+          trap restore_jobs EXIT
+
+          # A running local-model call is allowed to finish. Once each worker reaches
+          # its next control checkpoint it sees PAUSED and cannot start another task.
+          for _ in $(seq 1 900); do
+            ACTIVE="$(python3 - <<'PY'
+          import os
+          import sqlite3
+          from pathlib import Path
+
+          root = Path(os.environ['DEPLOY_DIR']) / 'workspaces'
+          total = 0
+          if root.exists():
+              for db in root.glob('*/ledger.sqlite3'):
+                  conn = sqlite3.connect(db, timeout=30)
+                  try:
+                      total += conn.execute("SELECT COUNT(*) FROM tasks WHERE status='IN_PROGRESS'").fetchone()[0]
+                  finally:
+                      conn.close()
+          print(total)
+          PY
+          )"
+            if [ "$ACTIVE" = "0" ]; then
+              echo "Safe checkpoint reached; no task is IN_PROGRESS."
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "$ACTIVE" != "0" ]; then
+            echo "Timed out waiting for a safe checkpoint; refusing to interrupt active research."
+            exit 1
+          fi
+
+          docker compose --env-file .env stop expert-my-rules
+          restore_jobs
+          trap - EXIT
+
+          if [ "$MODE" = "local" ]; then
+            docker compose --env-file .env --profile local-inference up -d --no-build --remove-orphans
+          else
+            docker compose --env-file .env up -d --no-build --remove-orphans
+          fi
 
           for _ in $(seq 1 60); do
             if curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/" >/dev/null; then
-              echo "Expert My Rules deploy and health check OK on port ${PORT}"
+              echo "Expert My Rules safe deploy and health check OK on port ${PORT}"
               exit 0
             fi
             sleep 2
