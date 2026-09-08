@@ -63,6 +63,19 @@ jobs:
           test -d "$DEPLOY_DIR/.git"
           test -f "$DEPLOY_DIR/.env"
 
+          # A previous manual chmod of switch-inference.sh can leave the production
+          # checkout dirty even when its bytes are exactly the committed bytes. Heal
+          # only that narrow metadata-only case; never overwrite real local content.
+          CHANGED="$(git -C "$DEPLOY_DIR" diff --name-only)"
+          if [ "$CHANGED" = "switch-inference.sh" ]; then
+            WORKTREE_BLOB="$(git hash-object "$DEPLOY_DIR/switch-inference.sh")"
+            INDEX_BLOB="$(git -C "$DEPLOY_DIR" rev-parse HEAD:switch-inference.sh)"
+            if [ "$WORKTREE_BLOB" = "$INDEX_BLOB" ]; then
+              echo "Healing executable-bit-only drift in switch-inference.sh"
+              git -C "$DEPLOY_DIR" checkout -- switch-inference.sh
+            fi
+          fi
+
           if [ -n "$(git -C "$DEPLOY_DIR" status --porcelain --untracked-files=no)" ]; then
             echo "Production checkout has tracked local changes; refusing to overwrite them."
             git -C "$DEPLOY_DIR" status --short
