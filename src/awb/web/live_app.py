@@ -155,3 +155,7 @@ class LiveActivityInjectionMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(LiveActivityInjectionMiddleware)
+
+# Register generic private-workspace import endpoints only in the deployed live app.
+# Imported project contents remain in the local workspace volume and never enter Git.
+from awb.web import private_import_routes as _private_import_routes  # noqa: E402,F401
