@@ -5,11 +5,8 @@ services:
     volumes:
       - ollama-models:/root/.ollama
     environment:
-      # Expert My Rules uses different model families sequentially. On small
-      # machines, keep only one model resident at a time to bound RAM/VRAM.
       - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}
       - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-1}
-      # Release model memory shortly after idle periods on 8 GB-class machines.
       - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-60s}
     restart: unless-stopped
     healthcheck:
@@ -27,16 +24,19 @@ services:
       - ./workspaces:/data/workspaces
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      # Local mode: http://ollama:11434. Remote mode: point this at a private
-      # LAN/Tailscale Ollama worker, e.g. http://100.x.y.z:11434.
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
-      # Heterogeneous local/remote ensemble. Qwen builds; Llama attacks; Gemma checks.
       - AWB_LOCAL_MODEL=${AWB_LOCAL_MODEL:-qwen3:4b}
       - AWB_PLANNER_MODEL=${AWB_PLANNER_MODEL:-qwen3:4b}
       - AWB_DIRECTOR_MODEL=${AWB_DIRECTOR_MODEL:-qwen3:4b}
       - AWB_WORKER_MODEL=${AWB_WORKER_MODEL:-qwen3:4b}
       - AWB_REVIEWER_MODEL=${AWB_REVIEWER_MODEL:-llama3.2:3b}
       - AWB_VERIFIER_MODEL=${AWB_VERIFIER_MODEL:-gemma3:4b}
+      # Optional shallow integration: no Lab data is stored inside Expert My Rules.
+      - RESEARCH_LAB_URL=${RESEARCH_LAB_URL:-http://research-lab:8300}
+      - RESEARCH_LAB_TOKEN=${RESEARCH_LAB_TOKEN:-}
+    networks:
+      - default
+      - home-lab
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000', timeout=3)"]
@@ -47,3 +47,8 @@ services:
 
 volumes:
   ollama-models:
+
+networks:
+  home-lab:
+    external: true
+    name: home-lab
