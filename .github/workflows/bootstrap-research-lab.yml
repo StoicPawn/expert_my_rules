@@ -1,0 +1,30 @@
+name: bootstrap-research-lab
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bootstrap-research-lab.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: [self-hosted, linux, expert-local]
+    timeout-minutes: 10
+    steps:
+      - name: Create standalone Research Lab repository if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh repo view StoicPawn/research_lab >/dev/null 2>&1; then
+            echo 'StoicPawn/research_lab already exists'
+          else
+            gh repo create StoicPawn/research_lab \
+              --public \
+              --description 'Shared isolated experiment runner and workspace service for home-lab projects' \
+              --add-readme
+            echo 'Created StoicPawn/research_lab'
+          fi
