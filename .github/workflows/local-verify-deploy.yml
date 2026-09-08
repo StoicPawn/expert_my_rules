@@ -72,6 +72,7 @@ jobs:
           git -C "$DEPLOY_DIR" checkout main
           git -C "$DEPLOY_DIR" reset --hard "${{ steps.rev.outputs.sha }}"
 
+          docker network inspect home-lab >/dev/null 2>&1 || docker network create home-lab
           cd "$DEPLOY_DIR"
           MODE="$(awk -F= '$1=="AWB_INFERENCE_MODE" {print $2}' .env | tail -n1)"
           MODE="${MODE:-local}"
