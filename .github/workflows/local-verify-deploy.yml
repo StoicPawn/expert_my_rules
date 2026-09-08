@@ -46,10 +46,11 @@ jobs:
           set -euo pipefail
           rm -rf .gha-venv
           python3 -m venv .gha-venv
-          .gha-venv/bin/python -m pip install --upgrade pip
-          .gha-venv/bin/pip install -e .
-          .gha-venv/bin/python -m compileall -q src
-          .gha-venv/bin/python -m unittest discover -s tests -v
+          export PATH="$PWD/.gha-venv/bin:$PATH"
+          python -m pip install --upgrade pip
+          pip install -e .
+          python -m compileall -q src
+          python -m unittest discover -s tests -v
           docker compose --env-file .env.example config >/dev/null
 
       - name: Deploy tested main
