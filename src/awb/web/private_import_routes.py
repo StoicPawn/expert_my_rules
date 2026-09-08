@@ -9,6 +9,10 @@ from awb.core.models import JobStatus
 from awb.core.private_import import PrivateImportError, import_private_bundle
 from awb.core.storage import Ledger
 from awb.web.app import _start, app, base_dir, page
+from awb.web.resilience import install_resilient_continuous_loop
+
+
+install_resilient_continuous_loop()
 
 
 @app.get('/private-import', response_class=HTMLResponse)
