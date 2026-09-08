@@ -114,7 +114,7 @@ def project_activity(slug: str):
 
 INJECTION = r"""
 <style>
-#live-activity-card{border:1px solid #dedee5}.live-current{display:flex;gap:12px;align-items:center;padding:12px 14px;background:#f4f7ff;border-radius:12px;margin-bottom:12px}.live-current.idle{background:#f3f3f5}.live-pulse{width:11px;height:11px;border-radius:50%;background:#2563eb;box-shadow:0 0 0 0 rgba(37,99,235,.5);animation:livepulse 1.6s infinite}@keyframes livepulse{70%{box-shadow:0 0 0 10px rgba(37,99,235,0)}100%{box-shadow:0 0 0 0 rgba(37,99,235,0)}}.live-feed{max-height:430px;overflow:auto}.live-row{display:grid;grid-template-columns:70px 1fr;gap:10px;padding:10px 4px;border-bottom:1px solid #eee}.live-time{font-variant-numeric:tabular-nums;color:#777;font-size:13px}.live-detail{color:#555;margin-top:3px;line-height:1.35}.live-row.active b{color:#1d4ed8}.live-row.ok b{color:#087c35}.live-row.warn b{color:#9a5200}.live-row.error b{color:#a11b1b}
+#live-activity-card{border:1px solid #dedee5}.live-current{display:flex;gap:12px;align-items:center;padding:12px 14px;background:#f4f7ff;border-radius:12px;margin-bottom:12px}.live-current.idle{background:#f3f3f5}.live-pulse{width:11px;height:11px;border-radius:50%;background:#2563eb;box-shadow:0 0 0 0 rgba(37,99,235,.5);animation:livepulse 1.6s infinite}@keyframes livepulse{70%{box-shadow:0 0 0 10px rgba(37,99,235,0)}100%{box-shadow:0 0 0 0 rgba(37,99,235,0)}}.live-feed{max-height:430px;overflow:auto;-webkit-overflow-scrolling:touch}.live-row{display:grid;grid-template-columns:70px 1fr;gap:10px;padding:10px 4px;border-bottom:1px solid #eee}.live-time{font-variant-numeric:tabular-nums;color:#777;font-size:13px}.live-detail{color:#555;margin-top:3px;line-height:1.35}.live-row.active b{color:#1d4ed8}.live-row.ok b{color:#087c35}.live-row.warn b{color:#9a5200}.live-row.error b{color:#a11b1b}
 </style>
 <div class='panel' id='live-activity-card'><h2>Live activity</h2><p class='muted'>Plain-language activity from the Director, Worker, Reviewer, Verifier and tools. Updates automatically while the project runs.</p><div id='live-activity'><div class='muted'>Loading activity…</div></div></div>
 <script>
@@ -122,11 +122,36 @@ INJECTION = r"""
  const parts=window.location.pathname.split('/').filter(Boolean);
  if(parts.length!==2 || parts[0]!=='project') return;
  const slug=encodeURIComponent(parts[1]);
+ const host=document.getElementById('live-activity');
+ let lastHtml='';
+ let refreshInFlight=false;
  async function refreshActivity(){
+   if(refreshInFlight) return;
+   refreshInFlight=true;
    try{
+     const oldFeed=host.querySelector('.live-feed');
+     const oldTop=oldFeed ? oldFeed.scrollTop : 0;
+     const oldDistanceFromBottom=oldFeed ? oldFeed.scrollHeight-oldFeed.clientHeight-oldFeed.scrollTop : null;
+     const pinnedToBottom=oldDistanceFromBottom!==null && oldDistanceFromBottom<28;
      const r=await fetch('/project/'+slug+'/activity',{cache:'no-store'});
-     if(r.ok) document.getElementById('live-activity').innerHTML=await r.text();
-   }catch(e){document.getElementById('live-activity').innerHTML='<div class="muted">Activity feed temporarily unavailable.</div>';}
+     if(!r.ok) return;
+     const nextHtml=await r.text();
+     if(nextHtml===lastHtml) return;
+     lastHtml=nextHtml;
+     host.innerHTML=nextHtml;
+     const newFeed=host.querySelector('.live-feed');
+     if(newFeed && oldFeed){
+       if(pinnedToBottom){
+         newFeed.scrollTop=newFeed.scrollHeight;
+       }else{
+         newFeed.scrollTop=Math.min(oldTop,Math.max(0,newFeed.scrollHeight-newFeed.clientHeight));
+       }
+     }
+   }catch(e){
+     if(!lastHtml) host.innerHTML='<div class="muted">Activity feed temporarily unavailable.</div>';
+   }finally{
+     refreshInFlight=false;
+   }
  }
  refreshActivity(); setInterval(refreshActivity,2000);
 })();
