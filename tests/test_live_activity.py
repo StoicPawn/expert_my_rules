@@ -41,11 +41,13 @@ class LiveActivityTests(unittest.TestCase):
             self.assertIn("2 critical objection", detail)
 
     def test_live_polling_does_not_replace_unchanged_dom_and_preserves_scroll(self):
-        self.assertIn("if(nextHtml===lastHtml) return;", INJECTION)
+        self.assertIn("if(next===lastHtml) return;", INJECTION)
         self.assertIn("const oldTop=oldFeed ? oldFeed.scrollTop : 0;", INJECTION)
         self.assertIn("newFeed.scrollTop=Math.min(oldTop", INJECTION)
-        self.assertIn("pinnedToBottom", INJECTION)
-        self.assertIn("refreshInFlight", INJECTION)
+        self.assertIn("const pinned=", INJECTION)
+        self.assertIn("let refreshing=false;", INJECTION)
+        self.assertIn("if(refreshing) return;", INJECTION)
+        self.assertIn("-webkit-overflow-scrolling:touch", INJECTION)
 
 
 if __name__ == "__main__":
