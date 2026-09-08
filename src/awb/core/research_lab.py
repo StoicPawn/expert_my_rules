@@ -46,17 +46,32 @@ class ResearchLabClient:
     def workspaces(self) -> list[dict[str, Any]]:
         return self.request('GET', '/api/workspaces')
 
-    def ensure_workspace(self, name: str, description: str = '') -> dict[str, Any]:
+    def ensure_workspace(self, project_key: str, name: str, description: str = '') -> dict[str, Any]:
+        project_key = project_key.strip()
+        if not project_key:
+            raise ResearchLabError('project_key cannot be empty')
         for workspace in self.workspaces():
-            if workspace.get('name') == name and workspace.get('source_project') == 'expert_my_rules':
+            metadata = workspace.get('metadata') or {}
+            if metadata.get('project_key') == project_key:
                 return workspace
         return self.request('POST', '/api/workspaces', {
             'name': name,
             'description': description,
-            'source_project': 'expert_my_rules',
+            'source_project': 'shared',
+            'metadata': {
+                'project_key': project_key,
+                'created_by': 'expert_my_rules',
+            },
         })
 
-    def run(self, workspace_id: str, title: str, code: str, timeout_seconds: int | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    def run(
+        self,
+        workspace_id: str,
+        title: str,
+        code: str,
+        timeout_seconds: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             'title': title,
             'code': code,
@@ -68,6 +83,13 @@ class ResearchLabClient:
 
     def runs(self, workspace_id: str) -> list[dict[str, Any]]:
         return self.request('GET', f'/api/workspaces/{workspace_id}/runs')
+
+    def latest_context(self, workspace_id: str) -> dict[str, Any] | None:
+        for run in self.runs(workspace_id):
+            metadata = run.get('metadata') or {}
+            if metadata.get('kind') in {'theory_context', 'shared_context'}:
+                return run
+        return None
 
 
 def execute_request(request_data: dict[str, Any]) -> Any:
@@ -81,19 +103,55 @@ def execute_request(request_data: dict[str, Any]) -> Any:
         return client.request('GET', '/api/capabilities')
 
     workspace_id = request_data.get('workspace_id')
+    project_key = str(
+        request_data.get('project_key')
+        or os.getenv('AWB_LAB_PROJECT_KEY')
+        or request_data.get('workspace_name')
+        or Path.cwd().name
+    ).strip()
+    workspace_name = str(
+        request_data.get('workspace_name')
+        or os.getenv('AWB_LAB_WORKSPACE')
+        or project_key
+    ).strip()
+
     if not workspace_id:
-        workspace_name = str(request_data.get('workspace_name') or os.getenv('AWB_LAB_WORKSPACE') or Path.cwd().name)
         workspace = client.ensure_workspace(
+            project_key,
             workspace_name,
-            str(request_data.get('workspace_description') or 'Experiments created by Expert My Rules'),
+            str(request_data.get('workspace_description') or 'Shared Research Lab project'),
         )
         workspace_id = workspace['id']
 
     if action == 'list_runs':
         return client.runs(str(workspace_id))
 
+    if action == 'latest_context':
+        return client.latest_context(str(workspace_id))
+
     if action == 'create_workspace':
-        return {'workspace_id': workspace_id}
+        return {'workspace_id': workspace_id, 'project_key': project_key}
+
+    if action == 'publish_context':
+        content = request_data.get('content')
+        if not isinstance(content, str) or not content.strip():
+            raise ResearchLabError('publish_context action requires non-empty content')
+        metadata = dict(request_data.get('metadata') or {})
+        metadata.update({
+            'caller': 'expert_my_rules',
+            'kind': str(request_data.get('kind') or 'shared_context'),
+            'project_key': project_key,
+            'content': content,
+        })
+        if request_data.get('sources') is not None:
+            metadata['sources'] = request_data['sources']
+        return client.run(
+            str(workspace_id),
+            str(request_data.get('title') or 'Expert context snapshot'),
+            "print('Expert My Rules context snapshot published')",
+            timeout_seconds=30,
+            metadata=metadata,
+        )
 
     if action != 'run':
         raise ResearchLabError(f'Unsupported action: {action}')
@@ -101,12 +159,15 @@ def execute_request(request_data: dict[str, Any]) -> Any:
     code = request_data.get('code')
     if not isinstance(code, str) or not code.strip():
         raise ResearchLabError('run action requires non-empty code')
+    metadata = dict(request_data.get('metadata') or {})
+    metadata.setdefault('caller', 'expert_my_rules')
+    metadata.setdefault('project_key', project_key)
     return client.run(
         str(workspace_id),
         str(request_data.get('title') or 'Expert My Rules experiment'),
         code,
         timeout_seconds=(int(request_data['timeout_seconds']) if request_data.get('timeout_seconds') is not None else None),
-        metadata=request_data.get('metadata') or {'caller': 'expert_my_rules'},
+        metadata=metadata,
     )
 
 
