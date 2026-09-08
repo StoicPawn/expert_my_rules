@@ -4,7 +4,7 @@ from pathlib import Path
 
 from awb.core.models import Task
 from awb.core.storage import Ledger
-from awb.web.live_app import _human_event
+from awb.web.live_app import INJECTION, _human_event
 
 
 class LiveActivityTests(unittest.TestCase):
@@ -39,6 +39,13 @@ class LiveActivityTests(unittest.TestCase):
             self.assertEqual(state, "warn")
             self.assertIn("challenged", title.lower())
             self.assertIn("2 critical objection", detail)
+
+    def test_live_polling_does_not_replace_unchanged_dom_and_preserves_scroll(self):
+        self.assertIn("if(nextHtml===lastHtml) return;", INJECTION)
+        self.assertIn("const oldTop=oldFeed ? oldFeed.scrollTop : 0;", INJECTION)
+        self.assertIn("newFeed.scrollTop=Math.min(oldTop", INJECTION)
+        self.assertIn("pinnedToBottom", INJECTION)
+        self.assertIn("refreshInFlight", INJECTION)
 
 
 if __name__ == "__main__":
