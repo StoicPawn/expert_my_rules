@@ -8,7 +8,7 @@ from .models import ProjectManifest, Workspace
 
 
 def _attach_optional_research_lab(data: dict) -> dict:
-    """Attach the standalone Lab as an optional HTTP-backed tool.
+    """Attach the standalone Lab as an optional HTTP-backed collaboration tool.
 
     Nothing is imported from Research Lab and no Lab data is stored in the AWB
     workspace. The integration exists only when both endpoint and token are present.
@@ -27,7 +27,9 @@ def _attach_optional_research_lab(data: dict) -> dict:
             'type': 'write_file',
             'description': (
                 'Write .awb_lab_request.json for the shared Research Lab. JSON actions: '
-                'run, list_workspaces, create_workspace, list_runs, capabilities. For run include code/title.'
+                'run, list_workspaces, create_workspace, list_runs, latest_context, '
+                'publish_context, capabilities. Use project_key to join Tutor LLM and '
+                'Expert My Rules to the same Lab workspace.'
             ),
             'writable': True,
         })
@@ -35,17 +37,33 @@ def _attach_optional_research_lab(data: dict) -> dict:
         tools.append({
             'id': 'research_lab',
             'type': 'shell',
-            'description': 'Execute the prepared .awb_lab_request.json against the standalone shared Research Lab.',
+            'description': (
+                'Execute the prepared .awb_lab_request.json against the standalone '
+                'shared Research Lab. The Lab stores experiments independently from '
+                'the Expert My Rules ledger.'
+            ),
             'command': 'python -m awb.core.research_lab execute .awb_lab_request.json',
             'timeout_seconds': 330,
         })
 
     for agent in data.get('agents', []):
-        if isinstance(agent, dict) and agent.get('role') == 'worker':
-            agent_tools = agent.setdefault('tools', [])
-            for tool_id in ('lab_request', 'research_lab'):
-                if tool_id not in agent_tools:
-                    agent_tools.append(tool_id)
+        if not isinstance(agent, dict) or agent.get('role') != 'worker':
+            continue
+        agent_tools = agent.setdefault('tools', [])
+        for tool_id in ('lab_request', 'research_lab'):
+            if tool_id not in agent_tools:
+                agent_tools.append(tool_id)
+        guidance = (
+            '\n\nShared Research Lab: when the task is marked as synchronized/shared, '
+            'use one stable project_key for the whole project. First request '
+            'latest_context to consume the newest Tutor LLM theory snapshot, then run '
+            'reproducible Python experiments as needed. Publish concise conclusions '
+            'back with publish_context so Tutor LLM and future runs can consume them. '
+            'Do not assume the Lab owns the paper library or this workspace ledger.'
+        )
+        instructions = str(agent.get('instructions') or '')
+        if 'Shared Research Lab:' not in instructions:
+            agent['instructions'] = instructions + guidance
     return data
 
 
