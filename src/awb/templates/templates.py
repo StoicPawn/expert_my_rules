@@ -106,9 +106,27 @@ def _runtime():
 def research_manifest(name, goal):
     agents = with_role_providers([
         {'id': 'director', 'role': 'director', 'instructions': 'Select the highest-information task. Prefer falsification, unresolved blockers and theorem-critical work.'},
-        {'id': 'researcher', 'role': 'worker', 'instructions': 'Develop or falsify claims rigorously. Preserve assumptions, proof dependencies, counterexamples and evidence.'},
+        {
+            'id': 'researcher',
+            'role': 'worker',
+            'instructions': (
+                'Develop or falsify claims rigorously. Preserve assumptions, proof dependencies, counterexamples and evidence. '
+                'When a shared Research Lab is configured, use lab_request.json plus the lab_execute tool for reproducible '
+                'Python, symbolic, numerical or context-sharing work instead of inventing results. Keep project-specific '
+                'research inside the private workspace/Lab, never in platform source code.'
+            ),
+            'tools': ['list', 'read', 'write', 'lab_execute'],
+        },
         {'id': 'referee', 'role': 'reviewer', 'instructions': 'Act independently and adversarially. Reject gaps, hidden assumptions, unsupported novelty and overclaiming.'},
-        {'id': 'verifier', 'role': 'verifier', 'instructions': 'Use available formal, symbolic, numerical and reproducibility checks. Be conservative when certifying completion gates.'},
+        {
+            'id': 'verifier',
+            'role': 'verifier',
+            'instructions': (
+                'Use available formal, symbolic, numerical and reproducibility checks. Be conservative when certifying '
+                'completion gates. Treat Research Lab output as experimental evidence, never as a substitute for proof.'
+            ),
+            'tools': ['list', 'read', 'write', 'lab_execute'],
+        },
     ])
     return {
         'name': name,
@@ -125,7 +143,21 @@ def research_manifest(name, goal):
             {'id': 'paper_ready', 'description': 'A complete, internally consistent, reproducible manuscript package is ready for expert submission review.', 'required': True, 'manual': False},
         ],
         'validators': {},
-        'tools': [],
+        'tools': [
+            {'id': 'list', 'type': 'list_files', 'description': 'List files in the private research workspace.'},
+            {'id': 'read', 'type': 'read_file', 'description': 'Read a private research-workspace text artifact.'},
+            {'id': 'write', 'type': 'write_file', 'description': 'Write a private research-workspace text artifact or Research Lab request.', 'writable': True},
+            {
+                'id': 'lab_execute',
+                'type': 'shell',
+                'description': (
+                    'Execute the request stored in lab_request.json against the configured shared Research Lab. '
+                    'Supported request actions include run, create_workspace, list_runs, latest_context and publish_context.'
+                ),
+                'command': 'python -m awb.core.research_lab execute lab_request.json',
+                'timeout_seconds': 360,
+            },
+        ],
         'runtime': _runtime(),
     }
 
