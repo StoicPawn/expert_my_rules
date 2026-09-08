@@ -21,7 +21,8 @@ def resilient_continuous_runner(root: Path, job_id: str) -> None:
     orch = Orchestrator(ws)
     ledger.update_job(job_id, status=JobStatus.RUNNING, detail='autonomous project active')
     consecutive_errors = 0
-    max_errors = max(6, ws.manifest.runtime.max_task_attempts * 3)
+    retry_limit = max(0, int(ws.manifest.runtime.technical_retry_limit))
+    max_backoff = max(2.0, float(ws.manifest.runtime.technical_retry_backoff_max_seconds))
 
     while True:
         current = ledger.get_job(job_id)
@@ -69,20 +70,22 @@ def resilient_continuous_runner(root: Path, job_id: str) -> None:
             ledger.event('continuous_runtime_retry', {
                 'error_type': error_type,
                 'consecutive_errors': consecutive_errors,
-                'max_errors': max_errors,
+                'retry_limit': retry_limit or 'unlimited',
+                'scientific_attempt_consumed': False,
             })
-            if consecutive_errors >= max_errors:
+            if retry_limit > 0 and consecutive_errors >= retry_limit:
                 ledger.update_job(
                     job_id,
                     status=JobStatus.FAILED,
-                    detail=f'persistent runtime failure after {consecutive_errors} retries: {error_type}',
+                    detail=f'persistent technical failure after {consecutive_errors} retries: {error_type}',
                 )
                 return
-            delay = min(60.0, 2.0 ** min(consecutive_errors, 5))
+            delay = min(max_backoff, 2.0 ** min(consecutive_errors, 8))
+            limit_label = str(retry_limit) if retry_limit > 0 else '∞'
             ledger.update_job(
                 job_id,
                 status=JobStatus.RUNNING,
-                detail=f'transient runtime failure ({error_type}); retry {consecutive_errors}/{max_errors} in {delay:.0f}s',
+                detail=f'technical retry {consecutive_errors}/{limit_label} after {error_type}; next in {delay:.0f}s; scientific work preserved',
             )
             time.sleep(delay)
 

@@ -17,6 +17,7 @@ DIRECTOR_SYSTEM="""You are the Director of an autonomous project workbench. Choo
 WORKER_SYSTEM="""You are an execution agent in an autonomous project workbench. Execute the assigned task rigorously. Produce inspectable evidence. Separate evidence, assumptions, uncertainty and conclusions. When tools are available you may call them by returning only {\"tool\":\"tool_id\",\"arguments\":{...}}. Never invent tool results. For software work, inspect the actual Git status/diff and run available checks before claiming success."""
 REVIEW_SYSTEM="""You are an independent adversarial Reviewer. Try to reject the candidate. Look for logical gaps, missing cases, non-reproducibility, unsafe changes, circular reasoning, goalpost shifting, regressions and unsupported claims. For software, treat the actual Git patch as primary evidence. Return REVIEW_JSON only as JSON: approved, critical_objections, recommendations."""
 GATE_SYSTEM="""You are the independent completion gatekeeper. Evaluate ONE completion condition conservatively from the recorded project evidence. Never pass a gate because progress merely looks promising. Never infer missing literature checks, tests, proofs, artifacts or external verification. If evidence is insufficient, keep it open. Return GATE_JSON only as JSON with: passed (bool), detail (str)."""
+RECOVERY_SYSTEM="""You are the Director repairing a scientifically BLOCKED task. A candidate was actually produced and challenged by an independent Reviewer/Verifier. Make progress without mechanically repeating the failed approach. Return RECOVERY_JSON only as JSON with: action (retry|decompose|reframe|reject), strategy (concrete materially different next approach), rationale, resolution_type (empty unless reject; one of false|ill_posed|superseded|not_required), replacement_title, replacement_description, subtasks (list of objects with title, description, priority). A retry must directly address the listed objections and must not merely ask the same question again. Decompose when prerequisite work or separate falsification checks are needed. Reframe when the original formulation should be replaced by a stronger/true/useful formulation. Reject only when evidence shows the original task/claim is false, ill-posed, superseded, or no longer required; NEVER reject merely because a numeric attempt threshold was reached. After several scientific blocks, prefer a structural change unless a genuinely new route is available."""
 
 
 class Orchestrator:
@@ -34,6 +35,9 @@ class Orchestrator:
         recovered=self.ledger.recover_interrupted_tasks()
         if recovered:
             self.ledger.event('interrupted_tasks_recovered',{'task_ids':recovered})
+        reconciled=self.ledger.reconcile_task_counters()
+        if reconciled:
+            self.ledger.event('task_counters_reconciled',{'task_ids':reconciled})
         for gate in workspace.manifest.gates:
             if gate.id not in self.ledger.gate_state():
                 self.ledger.set_gate(gate.id,False,'not evaluated')
@@ -53,8 +57,11 @@ class Orchestrator:
             return False
         if role not in p.roles or task is None:
             return False
-        attempts=int(task.metadata.get('attempts',0))
-        return attempts>=p.after_local_failures or task.priority>=p.priority_threshold
+        difficulty=max(
+            int(task.metadata.get('scientific_attempts',task.metadata.get('attempts',0))),
+            int(task.metadata.get('technical_failures',0)),
+        )
+        return difficulty>=p.after_local_failures or task.priority>=p.priority_threshold
 
     def _route_meta(self,role,node_id,kind,model,source):
         return {'role':role,'node':node_id,'kind':kind,'model':model,'source':source}
@@ -149,19 +156,36 @@ class Orchestrator:
         existing=self.ledger.list_tasks([TaskStatus.OPEN])
         if existing:
             return existing[0]
-        blocked=self.ledger.list_tasks([TaskStatus.BLOCKED])
-        retryable=[t for t in blocked if int(t.metadata.get('attempts',0))<self.workspace.manifest.runtime.max_task_attempts]
-        if retryable:
-            task=retryable[0]
+
+        technical=self.ledger.list_tasks([TaskStatus.ERROR])
+        if technical:
+            task=technical[0]
             task.status=TaskStatus.OPEN
             self.ledger.upsert_task(task)
-            self.ledger.event('task_reopened_for_retry',{'attempts':task.metadata.get('attempts',0)},task.id)
+            self.ledger.event('task_reopened_after_technical_error',{
+                'technical_failures':task.metadata.get('technical_failures',0),
+                'last_error':task.metadata.get('last_error',''),
+            },task.id)
             return task
+
+        blocked=self.ledger.list_tasks([TaskStatus.BLOCKED])
+        if blocked:
+            task=blocked[0]
+            task.status=TaskStatus.OPEN
+            self.ledger.upsert_task(task)
+            self.ledger.event('task_reopened_after_review',{
+                'scientific_attempts':task.metadata.get('scientific_attempts',task.metadata.get('attempts',0)),
+                'next_strategy':task.metadata.get('next_strategy',''),
+                'critical_objections':task.metadata.get('critical_objections',[])[:6],
+            },task.id)
+            return task
+
         selector=self.workflow.first('select_task')
         role=selector.role if selector and selector.role else 'director'
         context=self.snapshot()
-        if blocked:
-            context+='\nBLOCKED/EXHAUSTED TASKS:\n'+json.dumps([t.model_dump(mode='json') for t in blocked[:10]],indent=2)
+        rejected=self.ledger.list_tasks([TaskStatus.REJECTED])
+        if rejected:
+            context+='\nRESOLVED/REJECTED TASKS (do not blindly recreate them):\n'+json.dumps([t.model_dump(mode='json') for t in rejected[:10]],indent=2)
         raw=self._call_model(role,DIRECTOR_SYSTEM+'\n'+self._instructions(role),context)
         try:
             d=json.loads(raw)
@@ -177,6 +201,168 @@ class Orchestrator:
         self.ledger.upsert_task(task)
         self.ledger.event('task_created',task.model_dump(mode='json'),task.id)
         return task
+
+    @staticmethod
+    def _clip(value,limit=1200):
+        text=str(value or '').strip()
+        return text if len(text)<=limit else text[:limit]+'…'
+
+    def _recovery_context(self,task:Task):
+        strategy=self._clip(task.metadata.get('next_strategy',''),1600)
+        objections=[self._clip(x,800) for x in task.metadata.get('critical_objections',[])[:8]]
+        history=task.metadata.get('recovery_history',[])[-3:]
+        if not strategy and not objections and not history:
+            return 'none; this is the first scientific attempt'
+        payload={
+            'scientific_attempts_completed':int(task.metadata.get('scientific_attempts',task.metadata.get('attempts',0))),
+            'strategy_for_this_attempt':strategy,
+            'unresolved_objections':objections,
+            'recent_recovery_history':history,
+        }
+        return json.dumps(payload,indent=2,ensure_ascii=False)
+
+    def _spawn_recovery_task(self,parent:Task,title,description,priority,kind):
+        title=str(title or '').strip()
+        if not title:
+            return None
+        for existing in self.ledger.list_tasks():
+            if existing.metadata.get('parent_task_id')==parent.id and existing.title==title and existing.status!=TaskStatus.REJECTED:
+                return existing
+        child=Task(
+            id=f'TASK-{uuid.uuid4().hex[:8].upper()}',
+            title=title,
+            description=str(description or title).strip(),
+            priority=float(priority if priority is not None else parent.priority),
+            created_by='director-recovery',
+            metadata={
+                'parent_task_id':parent.id,
+                'origin':'blocked_recovery',
+                'recovery_kind':kind,
+            },
+        )
+        self.ledger.upsert_task(child)
+        self.ledger.event('task_created',child.model_dump(mode='json'),child.id)
+        return child
+
+    def _plan_blocked_recovery(self,task:Task,review:Review,verification_detail:str):
+        scientific=int(task.metadata.get('scientific_attempts',task.metadata.get('attempts',0)))
+        threshold=max(1,int(self.workspace.manifest.runtime.adaptive_replan_after_scientific_attempts))
+        objections=review.critical_objections or task.metadata.get('critical_objections',[]) or [verification_detail]
+        recommendations=review.recommendations or []
+        prompt=(
+            f'NORTH STAR:\n{self.workspace.manifest.goal}\n\nBLOCKED TASK:\n{task.model_dump_json()}\n\n'
+            f'SCIENTIFIC ATTEMPTS COMPLETED: {scientific}\nSOFT STRUCTURAL-REPLAN THRESHOLD: {threshold}\n\n'
+            f'CRITICAL OBJECTIONS:\n{json.dumps(objections,indent=2,ensure_ascii=False)}\n\n'
+            f'REVIEW RECOMMENDATIONS:\n{json.dumps(recommendations,indent=2,ensure_ascii=False)}\n\n'
+            f'VERIFICATION:\n{verification_detail}\n\n'
+            'Choose the next epistemically useful move. A numeric attempt count is never a reason to give up.'
+        )
+        role='director'
+        fallback={
+            'action':'retry',
+            'strategy':'Attack the unresolved objections explicitly with a materially different route; first try to falsify the previous candidate, then rebuild only what survives.',
+            'rationale':'Recovery planner unavailable; use conservative objection-driven fallback.',
+            'resolution_type':'',
+            'replacement_title':'',
+            'replacement_description':'',
+            'subtasks':[],
+        }
+        try:
+            raw=self._call_model(role,RECOVERY_SYSTEM+'\n'+self._instructions(role),prompt,task)
+            plan=json.loads(raw)
+            if not isinstance(plan,dict):
+                raise ValueError('RECOVERY_JSON must be an object')
+        except Exception as exc:
+            task.metadata['recovery_planner_failures']=int(task.metadata.get('recovery_planner_failures',0))+1
+            self.ledger.event('recovery_planner_error',{
+                'error':f'{type(exc).__name__}: {exc}',
+                'fallback':'retry with materially different objection-driven strategy',
+            },task.id)
+            plan=fallback
+
+        action=str(plan.get('action','retry')).strip().lower()
+        if action not in {'retry','decompose','reframe','reject'}:
+            action='retry'
+        strategy=self._clip(plan.get('strategy') or fallback['strategy'],2200)
+        rationale=self._clip(plan.get('rationale') or '',1800)
+        resolution_type=str(plan.get('resolution_type') or '').strip().lower()
+        if action=='reject' and resolution_type not in {'false','ill_posed','superseded','not_required'}:
+            action='retry'
+            rationale=(rationale+' Reject was downgraded because no admissible evidence-based resolution_type was supplied.').strip()
+
+        history=list(task.metadata.get('recovery_history',[]))
+        history.append({
+            'scientific_attempt':scientific,
+            'action':action,
+            'strategy':strategy,
+            'rationale':rationale,
+            'objections':[self._clip(x,500) for x in objections[:6]],
+        })
+        limit=max(1,int(self.workspace.manifest.runtime.recovery_history_limit))
+        task.metadata['recovery_history']=history[-limit:]
+        task.metadata['next_strategy']=strategy
+        task.metadata['last_recovery_action']=action
+        task.metadata['last_recovery_rationale']=rationale
+
+        subtasks=plan.get('subtasks') if isinstance(plan.get('subtasks'),list) else []
+        created=[]
+        if action=='decompose':
+            for item in subtasks[:6]:
+                if not isinstance(item,dict):
+                    continue
+                child=self._spawn_recovery_task(
+                    task,
+                    item.get('title'),
+                    item.get('description'),
+                    item.get('priority',task.priority+0.1),
+                    'decompose',
+                )
+                if child:
+                    created.append(child.id)
+            if not created:
+                child=self._spawn_recovery_task(
+                    task,
+                    f'Falsify blocker for {task.title}',
+                    'Independently isolate and attack the strongest unresolved objection before retrying the parent task.',
+                    task.priority+0.1,
+                    'decompose-fallback',
+                )
+                if child:
+                    created.append(child.id)
+            task.metadata['waiting_on_recovery_tasks']=created
+            task.status=TaskStatus.BLOCKED
+            self.ledger.event('task_decomposed',{'strategy':strategy,'subtask_ids':created},task.id)
+        elif action=='reframe':
+            replacement_title=str(plan.get('replacement_title') or f'Reframe: {task.title}').strip()
+            replacement_description=str(plan.get('replacement_description') or strategy or task.description).strip()
+            child=self._spawn_recovery_task(task,replacement_title,replacement_description,task.priority,'reframe')
+            task.status=TaskStatus.REJECTED
+            task.metadata['resolution']='reframed'
+            task.metadata['rejection_reason']=rationale or 'Original formulation was superseded by an explicit replacement.'
+            task.metadata['replacement_task_id']=child.id if child else None
+            self.ledger.event('task_reframed',{
+                'replacement_task_id':child.id if child else None,
+                'strategy':strategy,
+                'rationale':task.metadata['rejection_reason'],
+            },task.id)
+        elif action=='reject':
+            task.status=TaskStatus.REJECTED
+            task.metadata['resolution']=resolution_type
+            task.metadata['rejection_reason']=rationale or f'Evidence-based resolution: {resolution_type}'
+            task.metadata['rejection_evidence_basis']=self._clip(plan.get('evidence_basis') or '',1800)
+            self.ledger.event('task_rejected_by_evidence',{
+                'resolution_type':resolution_type,
+                'rationale':task.metadata['rejection_reason'],
+            },task.id)
+        else:
+            task.status=TaskStatus.BLOCKED
+            self.ledger.event('task_recovery_planned',{
+                'scientific_attempts':scientific,
+                'strategy':strategy,
+                'rationale':rationale,
+                'structural_replan_recommended':scientific>=threshold,
+            },task.id)
+        return plan
 
     def _execute_with_tools(self,task:Task,stage:WorkflowStageSpec,prompt:str,execution_root:Path):
         role=stage.role or 'worker'
@@ -307,12 +493,18 @@ class Orchestrator:
 
     def step(self):
         task=self.choose_next_task()
-        attempts=int(task.metadata.get('attempts',0))+1
-        task.metadata['attempts']=attempts
+        execution_attempt=int(task.metadata.get('execution_attempts',0))+1
+        task.metadata['execution_attempts']=execution_attempt
         task.status=TaskStatus.IN_PROGRESS
+        task.metadata.pop('last_error',None)
+        active_strategy=task.metadata.get('next_strategy','')
         self.ledger.upsert_task(task)
-        self.ledger.event('task_started',{'attempt':attempts},task.id)
-        attempt_id=self.ledger.start_attempt(task.id,attempts)
+        self.ledger.event('task_started',{
+            'execution_attempt':execution_attempt,
+            'scientific_attempt_next':int(task.metadata.get('scientific_attempts',task.metadata.get('attempts',0)))+1,
+            'strategy':active_strategy,
+        },task.id)
+        attempt_id=self.ledger.start_attempt(task.id,execution_attempt)
         self._attempt_routes=[]
         task_workspace=None
         try:
@@ -333,6 +525,9 @@ class Orchestrator:
                     prior='\n\n'.join(f'{k}:\n{v}' for k,v in outputs.items())
                     prompt=(
                         f'NORTH STAR:\n{self.workspace.manifest.goal}\n\nTASK:\n{task.title}\n{task.description}\n\n'
+                        f'RECOVERY CONTEXT:\n{self._recovery_context(task)}\n\n'
+                        'If recovery context contains prior objections, do not repeat the same approach mechanically. '
+                        'Explicitly explain how this attempt differs and how it resolves or falsifies those objections.\n\n'
                         f'STATE:\n{self.snapshot()}\n\nPRIOR STAGE OUTPUTS:\n{prior or "none"}'
                     )
                     outputs[stage.id]=self._execute_with_tools(task,stage,prompt,execution_root)
@@ -358,6 +553,13 @@ class Orchestrator:
             verified=all(ok for _,ok,_ in considered_verifications) if considered_verifications else True
             verification_detail='\n\n'.join(f'[{s.id}] {detail}' for s,_,detail in verification_records) or 'No workflow validation stage configured.'
 
+            scientific_attempts=int(task.metadata.get('scientific_attempts',task.metadata.get('attempts',0)))+1
+            task.metadata['scientific_attempts']=scientific_attempts
+            task.metadata['attempts']=scientific_attempts
+            task.metadata['last_completed_strategy']=active_strategy
+            task.metadata['last_review_recommendations']=aggregate_review.recommendations[:12]
+            task.metadata.pop('last_error',None)
+
             patch=self.git.patch(task.id) if self.git.enabled else ''
             patch_summary=self.git.diff_summary(task.id) if self.git.enabled else ''
             patch_artifact=self._save_patch(task,patch)
@@ -365,12 +567,19 @@ class Orchestrator:
             if aggregate_review.approved and verified:
                 task.status=TaskStatus.DONE
                 task.metadata.pop('critical_objections',None)
-            elif attempts>=self.workspace.manifest.runtime.max_task_attempts:
-                task.status=TaskStatus.REJECTED
-                task.metadata['critical_objections']=aggregate_review.critical_objections or [verification_detail]
+                task.metadata.pop('next_strategy',None)
+                task.metadata.pop('waiting_on_recovery_tasks',None)
+                self.ledger.event('task_scientifically_closed',{'scientific_attempts':scientific_attempts},task.id)
             else:
                 task.status=TaskStatus.BLOCKED
                 task.metadata['critical_objections']=aggregate_review.critical_objections or [verification_detail]
+                task.metadata['last_verification_detail']=verification_detail
+                self.ledger.event('task_blocked',{
+                    'scientific_attempts':scientific_attempts,
+                    'critical_objections':task.metadata['critical_objections'][:8],
+                    'verification_passed':verified,
+                },task.id)
+                self._plan_blocked_recovery(task,aggregate_review,verification_detail)
 
             review_payload={stage.id:review.model_dump(mode='json') for stage,review in stage_reviews}
             artifact=self._save_artifact(task,output,aggregate_review,review_payload,verification_detail,patch_artifact,patch_summary)
@@ -384,9 +593,9 @@ class Orchestrator:
                 self.ledger.event('git_candidate_merged',merge_result,task.id)
             elif self.git.enabled and task.status==TaskStatus.REJECTED:
                 self.git.discard(task.id)
-                self.ledger.event('git_candidate_discarded',{'reason':'max attempts exhausted'},task.id)
+                self.ledger.event('git_candidate_discarded',{'reason':task.metadata.get('rejection_reason','evidence-based resolution')},task.id)
             elif self.git.enabled and task.status==TaskStatus.BLOCKED:
-                self.ledger.event('git_candidate_preserved',{'reason':'retryable rejection'},task.id)
+                self.ledger.event('git_candidate_preserved',{'reason':'scientific review blocker; recovery planned'},task.id)
 
             self.ledger.upsert_task(task)
             self.evaluate_gates()
@@ -409,11 +618,17 @@ class Orchestrator:
                 next_task=next_task,
             )
         except Exception as exc:
-            task.status=TaskStatus.BLOCKED
+            task.status=TaskStatus.ERROR
+            task.metadata['technical_failures']=int(task.metadata.get('technical_failures',0))+1
             task.metadata['last_error']=f'{type(exc).__name__}: {exc}'
+            task.metadata['attempts']=int(task.metadata.get('scientific_attempts',task.metadata.get('attempts',0)))
             self.ledger.upsert_task(task)
-            self.ledger.event('task_failed',{'error':task.metadata['last_error']},task.id)
-            self.ledger.finish_attempt(attempt_id,status='FAILED',route={'calls':self._attempt_routes},error=task.metadata['last_error'])
+            self.ledger.event('task_technical_error',{
+                'error':task.metadata['last_error'],
+                'technical_failures':task.metadata['technical_failures'],
+                'scientific_attempts':task.metadata.get('scientific_attempts',task.metadata.get('attempts',0)),
+            },task.id)
+            self.ledger.finish_attempt(attempt_id,status='TECHNICAL_ERROR',route={'calls':self._attempt_routes},error=task.metadata['last_error'])
             raise
 
     def run(self,max_steps=None,max_minutes=None,control=None,on_step=None):

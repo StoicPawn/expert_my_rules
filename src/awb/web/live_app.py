@@ -65,8 +65,28 @@ def _human_event(event: dict, ledger: Ledger) -> tuple[str, str, str]:
     if kind == "gate_evaluated":
         passed = bool(payload.get("passed"))
         return ("ok" if passed else "info"), f"Completion condition {'passed' if passed else 'remains open'}", f"{payload.get('gate', 'gate')}: {payload.get('detail', '')}"[:350]
+    if kind == "task_technical_error":
+        return "error", f"Technical error: {task}", f"{payload.get('error', 'Unknown runtime error')} · scientific attempts unchanged; technical failures: {payload.get('technical_failures', '?')}."
+    if kind == "task_blocked":
+        objections = payload.get("critical_objections") or []
+        detail = str(objections[0]) if objections else "The candidate did not yet satisfy adversarial review/verification."
+        return "warn", f"Scientific review blocked: {task}", f"Scientific attempt {payload.get('scientific_attempts', '?')}: {detail}"
+    if kind == "task_recovery_planned":
+        return "info", "Director planned a different approach", str(payload.get("strategy", "Retry by explicitly resolving the objections."))[:350]
+    if kind == "task_decomposed":
+        return "info", "Blocked task decomposed", f"Created {len(payload.get('subtask_ids') or [])} prerequisite/falsification task(s). {str(payload.get('strategy', ''))[:260]}"
+    if kind == "task_reframed":
+        return "info", "Task reframed", f"The original formulation was superseded by {payload.get('replacement_task_id') or 'a replacement task'}. {str(payload.get('rationale', ''))[:260]}"
+    if kind == "task_rejected_by_evidence":
+        return "warn", "Task resolved as rejected by evidence", f"{payload.get('resolution_type', 'evidence')}: {str(payload.get('rationale', ''))[:280]}"
+    if kind == "task_reopened_after_review":
+        return "active", f"Retrying scientifically blocked task: {task}", str(payload.get("next_strategy", "Use a materially different route that addresses the objections."))[:350]
+    if kind == "task_reopened_after_technical_error":
+        return "active", f"Retrying after technical error: {task}", "The scientific attempt counter was not consumed."
+    if kind == "task_scientifically_closed":
+        return "ok", f"Task scientifically closed: {task}", f"Accepted after {payload.get('scientific_attempts', '?')} scientific attempt(s)."
     if kind == "task_failed":
-        return "error", f"Task failed: {task}", str(payload.get("error", "Unknown task error"))
+        return "error", f"Legacy task failure: {task}", str(payload.get("error", "Unknown task error"))
     if kind == "interrupted_tasks_recovered":
         return "warn", "Recovered interrupted work", f"Reopened {len(payload.get('task_ids') or [])} task(s) left in progress by a previous stop or crash."
     if kind == "run_started":

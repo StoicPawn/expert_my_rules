@@ -34,16 +34,37 @@ class Ledger:
         else: rows=self.conn.execute('SELECT * FROM tasks ORDER BY priority DESC,created_at ASC').fetchall()
         return [self._row_to_task(r) for r in rows]
     def recover_interrupted_tasks(self):
-        rows=self.conn.execute("SELECT id,metadata_json FROM tasks WHERE status='IN_PROGRESS'").fetchall()
-        recovered=[]
+        rows = self.conn.execute("SELECT id,metadata_json FROM tasks WHERE status='IN_PROGRESS'").fetchall()
+        recovered = []
+        now = self._now()
         for r in rows:
-            metadata=json.loads(r['metadata_json']); metadata['interrupted_recovery_count']=int(metadata.get('interrupted_recovery_count',0))+1
-            self.conn.execute('UPDATE tasks SET status=?,metadata_json=?,updated_at=? WHERE id=?',(TaskStatus.OPEN.value,json.dumps(metadata),self._now(),r['id']))
+            metadata = json.loads(r['metadata_json'])
+            count = int(metadata.get('interrupt_recoveries', metadata.get('interrupted_recovery_count', 0))) + 1
+            metadata['interrupt_recoveries'] = count
+            metadata['interrupted_recovery_count'] = count  # legacy alias
+            self.conn.execute(
+                'UPDATE tasks SET status=?,metadata_json=?,updated_at=? WHERE id=?',
+                (TaskStatus.OPEN.value, json.dumps(metadata), now, r['id']),
+            )
+            self.conn.execute(
+                """UPDATE attempts
+                   SET status='INTERRUPTED',
+                       error=CASE WHEN error='' THEN 'interrupted by process stop or restart' ELSE error END,
+                       finished_at=?
+                   WHERE task_id=? AND status='RUNNING'""",
+                (now, r['id']),
+            )
             recovered.append(r['id'])
         if recovered:
             self.conn.commit()
-            for task_id in recovered: self.event('task_recovered',{'reason':'task was left IN_PROGRESS by an interrupted worker and was reopened'},task_id)
+            for task_id in recovered:
+                self.event(
+                    'task_recovered',
+                    {'reason': 'task was interrupted and reopened without consuming a scientific attempt'},
+                    task_id,
+                )
         return recovered
+
     def event(self,kind,payload,task_id=None): self.conn.execute('INSERT INTO events(ts,kind,task_id,payload_json) VALUES(?,?,?,?)',(self._now(),kind,task_id,json.dumps(payload))); self.conn.commit()
     def set_gate(self,gate_id,passed,detail=''): self.conn.execute('''INSERT INTO gates(gate_id,passed,detail,updated_at) VALUES(?,?,?,?) ON CONFLICT(gate_id) DO UPDATE SET passed=excluded.passed,detail=excluded.detail,updated_at=excluded.updated_at''',(gate_id,int(passed),detail,self._now())); self.conn.commit()
     def gate_state(self): return {r['gate_id']:{'passed':bool(r['passed']),'detail':r['detail']} for r in self.conn.execute('SELECT * FROM gates').fetchall()}
@@ -63,6 +84,70 @@ class Ledger:
                 item[key[:-5]]=json.loads(item.pop(key) or '{}')
             out.append(item)
         return out
+    def reconcile_task_counters(self):
+        """Rebuild task counters from the durable attempt ledger.
+
+        Old versions mixed scientific rejections, timeouts and restarts in one
+        `attempts` counter. This migration is intentionally local to each workspace:
+        failed runtime attempts become technical failures, interrupted attempts are
+        recoveries, and only reviewed outcomes count as scientific attempts.
+        """
+        task_rows = self.conn.execute('SELECT * FROM tasks').fetchall()
+        changed = []
+        events = []
+        for row in task_rows:
+            metadata = json.loads(row['metadata_json'])
+            attempts = self.conn.execute(
+                'SELECT status,error FROM attempts WHERE task_id=? ORDER BY started_at ASC',
+                (row['id'],),
+            ).fetchall()
+            if attempts:
+                scientific = sum(1 for a in attempts if a['status'] in {'BLOCKED', 'DONE', 'REJECTED'})
+                technical = sum(1 for a in attempts if a['status'] in {'FAILED', 'TECHNICAL_ERROR'})
+                interrupted = sum(1 for a in attempts if a['status'] == 'INTERRUPTED')
+                execution = len(attempts)
+                latest_status = attempts[-1]['status']
+            else:
+                scientific = int(metadata.get('scientific_attempts', metadata.get('attempts', 0)))
+                technical = int(metadata.get('technical_failures', 0))
+                interrupted = int(metadata.get('interrupt_recoveries', metadata.get('interrupted_recovery_count', 0)))
+                execution = max(int(metadata.get('execution_attempts', 0)), scientific + technical + interrupted)
+                latest_status = ''
+
+            metadata['scientific_attempts'] = scientific
+            metadata['technical_failures'] = technical
+            metadata['execution_attempts'] = execution
+            metadata['interrupt_recoveries'] = max(
+                interrupted,
+                int(metadata.get('interrupt_recoveries', metadata.get('interrupted_recovery_count', 0))),
+            )
+            metadata['interrupted_recovery_count'] = metadata['interrupt_recoveries']
+            metadata['attempts'] = scientific  # compatibility alias used by older clients
+
+            status = row['status']
+            if status == TaskStatus.REJECTED.value and not metadata.get('rejection_reason') and not metadata.get('resolution'):
+                status = TaskStatus.BLOCKED.value
+                metadata['legacy_rejection_reopened'] = True
+                events.append(('legacy_rejection_reopened', {'scientific_attempts': scientific}, row['id']))
+            if status == TaskStatus.BLOCKED.value and (
+                latest_status in {'FAILED', 'TECHNICAL_ERROR'} or (not attempts and metadata.get('last_error') and scientific == 0)
+            ):
+                status = TaskStatus.ERROR.value
+                events.append(('legacy_technical_block_reclassified', {'technical_failures': technical}, row['id']))
+
+            old_metadata = json.loads(row['metadata_json'])
+            if status != row['status'] or metadata != old_metadata:
+                self.conn.execute(
+                    'UPDATE tasks SET status=?,metadata_json=?,updated_at=? WHERE id=?',
+                    (status, json.dumps(metadata), self._now(), row['id']),
+                )
+                changed.append(row['id'])
+        if changed:
+            self.conn.commit()
+        for kind, payload, task_id in events:
+            self.event(kind, payload, task_id)
+        return changed
+
     def record_model_call(self,*,task_id=None,role:str,node:str,kind:str,model:str|None,source:str,success:bool,seconds:float,chars:int=0,error:str=''):
         self.conn.execute('''INSERT INTO model_calls(ts,task_id,role,node,kind,model,source,success,seconds,chars,error) VALUES(?,?,?,?,?,?,?,?,?,?,?)''',(self._now(),task_id,role,node,kind,model,source,int(success),max(0.0,float(seconds)),max(0,int(chars)),error)); self.conn.commit()
     def recent_model_calls(self,limit:int=100):

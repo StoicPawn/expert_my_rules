@@ -8,8 +8,12 @@ from pydantic import BaseModel, Field
 class TaskStatus(str, Enum):
     OPEN = 'OPEN'
     IN_PROGRESS = 'IN_PROGRESS'
+    # Scientific/evidentiary blocker after a candidate was actually reviewed.
     BLOCKED = 'BLOCKED'
+    # Technical/runtime failure. This is retryable and never consumes a scientific attempt.
+    ERROR = 'ERROR'
     DONE = 'DONE'
+    # Deliberate epistemic resolution only (false/ill-posed/superseded/reframed), never an attempt-limit timeout.
     REJECTED = 'REJECTED'
 
 
@@ -145,7 +149,13 @@ class RuntimePolicy(BaseModel):
     escalation: EscalationPolicy = Field(default_factory=EscalationPolicy)
     max_steps_per_run: int = 25
     max_minutes_per_run: int = 60
+    # Kept for manifest compatibility. It is now a soft re-planning signal, not a hard rejection cap.
     max_task_attempts: int = 3
+    adaptive_replan_after_scientific_attempts: int = 3
+    # 0 means unlimited autonomous technical retries; they use bounded exponential backoff.
+    technical_retry_limit: int = 0
+    technical_retry_backoff_max_seconds: float = 300.0
+    recovery_history_limit: int = 8
     max_tool_calls_per_task: int = 12
     continuous_session_steps: int = 50
     continuous_session_minutes: int = 30

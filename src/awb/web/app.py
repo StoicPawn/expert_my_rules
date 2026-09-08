@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
-from awb.core.models import Gate, JobStatus, Task
+from awb.core.models import Gate, JobStatus, Task, TaskStatus
 from awb.core.orchestrator import Orchestrator
 from awb.core.planner import propose_manifest
 from awb.core.storage import Ledger
@@ -96,7 +96,27 @@ def project(slug_:str):
     l=Ledger(root/'ledger.sqlite3'); state=l.gate_state(); job=l.latest_job(); esc=ws.manifest.runtime.escalation
     gate_rows=''.join(f"<tr><td><b>{html.escape(g.id)}</b><br>{html.escape(g.description)}</td><td class='{'pass' if state.get(g.id,{}).get('passed') else 'open'}'>{'PASS' if state.get(g.id,{}).get('passed') else 'OPEN'}</td><td><form class='inline' method='post' action='/project/{slug_}/gate'><input type='hidden' name='gate_id' value='{html.escape(g.id)}'><button name='state' value='pass'>Pass</button><button class='secondary' name='state' value='open'>Reopen</button></form></td></tr>" for g in ws.manifest.gates)
     agents=''.join(f"<div class='panel'><h3>{html.escape(a.id)} <span class='type'>{html.escape(a.role)}</span></h3><form method='post' action='/project/{slug_}/agent'><input type='hidden' name='agent_id' value='{html.escape(a.id)}'><textarea name='instructions' rows='5'>{html.escape(a.instructions)}</textarea><button>Save instructions</button></form></div>" for a in ws.manifest.agents)
-    tasks=''.join(f"<tr><td>{html.escape(t.id)}</td><td>{html.escape(t.title)}</td><td>{t.status.value}</td><td>{t.metadata.get('attempts',0)}</td></tr>" for t in l.list_tasks()) or "<tr><td colspan='4'>The Director will create the first task after launch.</td></tr>"
+    l.reconcile_task_counters()
+    def task_row(t):
+        scientific=int(t.metadata.get('scientific_attempts',t.metadata.get('attempts',0)))
+        technical=int(t.metadata.get('technical_failures',0))
+        recoveries=int(t.metadata.get('interrupt_recoveries',t.metadata.get('interrupted_recovery_count',0)))
+        status=t.status.value
+        if t.status==TaskStatus.BLOCKED: status='BLOCKED (review)'
+        elif t.status==TaskStatus.ERROR: status='ERROR (technical)'
+        reason=''
+        if t.status==TaskStatus.ERROR:
+            reason=str(t.metadata.get('last_error',''))
+        elif t.status==TaskStatus.BLOCKED:
+            objections=t.metadata.get('critical_objections',[])
+            reason=str(objections[0] if objections else t.metadata.get('last_verification_detail',''))
+        elif t.status==TaskStatus.REJECTED:
+            reason=str(t.metadata.get('rejection_reason',''))
+        strategy=str(t.metadata.get('next_strategy',''))
+        if len(reason)>180: reason=reason[:180]+'…'
+        if len(strategy)>180: strategy=strategy[:180]+'…'
+        return f"<tr><td>{html.escape(t.id)}</td><td>{html.escape(t.title)}</td><td>{html.escape(status)}</td><td>{scientific}</td><td>{technical}</td><td>{recoveries}</td><td>{html.escape(reason)}</td><td>{html.escape(strategy)}</td></tr>"
+    tasks=''.join(task_row(t) for t in l.list_tasks()) or "<tr><td colspan='8'>The Director will create the first task after launch.</td></tr>"
     cloud=f"{'ENABLED' if esc.enabled else 'OFF'} · budget €{esc.daily_budget_eur:.2f}/day · max {esc.max_cloud_calls_per_run} cloud calls/run"
     body=f"""<a href='/'>← Projects</a><h1>{html.escape(ws.manifest.name)}</h1><div class='type'>{html.escape(ws.manifest.type)}</div>
     <div class='panel'><h2>North Star</h2><form method='post' action='/project/{slug_}/goal'><textarea name='goal' rows='5'>{html.escape(ws.manifest.goal)}</textarea><button>Save goal</button></form></div>
@@ -105,7 +125,7 @@ def project(slug_:str):
     <div class='panel'><h2>Definition of Done</h2><p class='muted'>Edit these before launch or at any time. The system may not declare completion until all required gates pass.</p><table><tr><th>Condition</th><th>State</th><th>Control</th></tr>{gate_rows}</table><h3>Add condition</h3><form method='post' action='/project/{slug_}/gate/add'><input name='gate_id' required placeholder='condition id'><textarea name='description' required rows='2' placeholder='What must be objectively true?'></textarea><button>Add condition</button></form></div>
     <h2>Proposed team</h2><div class='grid'>{agents}</div>
     <div class='panel'><h2>Direct the project without changing its goal</h2><form method='post' action='/project/{slug_}/task'><input name='title' required placeholder='Optional temporary directive'><textarea name='description' rows='3' placeholder='Example: tonight attack the converse with counterexamples first'></textarea><button>Add directive</button></form></div>
-    <div class='panel'><h2>Task ledger</h2><table><tr><th>ID</th><th>Task</th><th>Status</th><th>Attempts</th></tr>{tasks}</table></div>"""
+    <div class='panel'><h2>Task ledger</h2><p class='muted'>Scientific attempts count only completed candidate→review cycles. Technical failures and restart recoveries are tracked separately and do not consume scientific attempts.</p><table><tr><th>ID</th><th>Task</th><th>Status</th><th>Scientific</th><th>Technical</th><th>Recoveries</th><th>Why</th><th>Next strategy</th></tr>{tasks}</table></div>"""
     return page(ws.manifest.name,body)
 
 @app.post('/project/{slug_}/goal')
