@@ -12,7 +12,7 @@ jobs:
     runs-on: [self-hosted, linux, expert-local]
     timeout-minutes: 10
     steps:
-      - name: Resume continuous work stranded by cancelled safe deploy
+      - name: Restore the Kellerer continuous job if the cancelled deploy stranded it paused
         shell: bash
         env:
           DEPLOY_DIR: /home/stoicpawn/projects/expert_my_rules
@@ -27,25 +27,32 @@ jobs:
 
           root = Path('/data/workspaces')
           resumed = []
+          observed = []
           for db in root.glob('*/ledger.sqlite3') if root.exists() else []:
               conn = sqlite3.connect(db, timeout=30)
+              conn.row_factory = sqlite3.Row
               try:
-                  active = conn.execute("SELECT COUNT(*) FROM tasks WHERE status='IN_PROGRESS'").fetchone()[0]
-                  if not active:
+                  theorem = conn.execute(
+                      "SELECT id,title,status FROM tasks WHERE id='SEED-001' AND title LIKE '%central theorem%' LIMIT 1"
+                  ).fetchone()
+                  if theorem is None:
                       continue
-                  rows = conn.execute(
-                      "SELECT id FROM jobs WHERE continuous=1 AND status='PAUSED' AND detail='paused by user'"
-                  ).fetchall()
-                  now = datetime.now(timezone.utc).isoformat()
-                  for (job_id,) in rows:
+                  job = conn.execute(
+                      "SELECT id,status,detail,updated_at FROM jobs WHERE continuous=1 ORDER BY created_at DESC LIMIT 1"
+                  ).fetchone()
+                  observed.append((db.parent.name, dict(job) if job else None, dict(theorem)))
+                  if job and job['status'] == 'PAUSED' and job['detail'] == 'paused by user':
+                      now = datetime.now(timezone.utc).isoformat()
                       conn.execute(
                           "UPDATE jobs SET status='RUNNING', detail='recovered after cancelled safe deploy', updated_at=? WHERE id=?",
-                          (now, job_id),
+                          (now, job['id']),
                       )
-                      resumed.append((db.parent.name, job_id))
-                  conn.commit()
+                      conn.commit()
+                      resumed.append((db.parent.name, job['id']))
               finally:
                   conn.close()
+          for slug, job, theorem in observed:
+              print(f"observed {slug} job={job} theorem={theorem}")
           for slug, job_id in resumed:
               print(f"resumed {slug} {job_id}")
           print(f"resumed_count={len(resumed)}")
