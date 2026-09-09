@@ -11,7 +11,10 @@ permissions:
 
 concurrency:
   group: expert-my-rules-local-main
-  cancel-in-progress: true
+  # A skipped workflow_run (for example CI on a feature branch) must never
+  # cancel a main deployment that is patiently waiting for an active research
+  # step to reach a safe checkpoint.
+  cancel-in-progress: false
 
 jobs:
   verify-and-deploy:

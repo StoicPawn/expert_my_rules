@@ -80,6 +80,31 @@ class LiveActivityTests(unittest.TestCase):
             self.assertIn("prove the disjoint-union step", rendered)
             self.assertIn("pin the exact strong-Markov theorem", rendered)
 
+    def test_new_candidate_does_not_inherit_review_from_previous_attempt(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ledger = Ledger(root / "ledger.sqlite3")
+            task = Task(id="SEED-001", title="Audit theorem", description="x")
+            ledger.upsert_task(task)
+            ledger.event("work_output", {"stage": "execute", "text": "old candidate"}, task.id)
+            ledger.event(
+                "review",
+                {
+                    "stage": "review",
+                    "approved": False,
+                    "critical_objections": ["old objection must not leak"],
+                    "recommendations": [],
+                },
+                task.id,
+            )
+            ledger.event("work_output", {"stage": "execute", "text": "new candidate under review"}, task.id)
+
+            rendered = _candidate_review_html(root, ledger, task.id)
+
+            self.assertIn("new candidate under review", rendered)
+            self.assertIn("review pending / not yet persisted", rendered)
+            self.assertNotIn("old objection must not leak", rendered)
+
     def test_live_polling_does_not_replace_unchanged_dom_and_preserves_scroll(self):
         self.assertIn("if(next===lastHtml) return;", INJECTION)
         self.assertIn("const oldTop=oldFeed ? oldFeed.scrollTop : 0;", INJECTION)
