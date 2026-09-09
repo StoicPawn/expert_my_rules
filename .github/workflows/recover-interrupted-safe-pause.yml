@@ -1,0 +1,52 @@
+name: recover-interrupted-safe-pause
+
+on:
+  push:
+    branches: ["fix/inspection-review-correlation"]
+
+permissions:
+  contents: read
+
+jobs:
+  resume-interrupted-safe-pause:
+    runs-on: [self-hosted, linux, expert-local]
+    timeout-minutes: 10
+    steps:
+      - name: Resume continuous work stranded by cancelled safe deploy
+        shell: bash
+        env:
+          DEPLOY_DIR: /home/stoicpawn/projects/expert_my_rules
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_DIR"
+          test -f .env
+          docker compose --env-file .env exec -T expert-my-rules python - <<'PY'
+          import sqlite3
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path('/data/workspaces')
+          resumed = []
+          for db in root.glob('*/ledger.sqlite3') if root.exists() else []:
+              conn = sqlite3.connect(db, timeout=30)
+              try:
+                  active = conn.execute("SELECT COUNT(*) FROM tasks WHERE status='IN_PROGRESS'").fetchone()[0]
+                  if not active:
+                      continue
+                  rows = conn.execute(
+                      "SELECT id FROM jobs WHERE continuous=1 AND status='PAUSED' AND detail='paused by user'"
+                  ).fetchall()
+                  now = datetime.now(timezone.utc).isoformat()
+                  for (job_id,) in rows:
+                      conn.execute(
+                          "UPDATE jobs SET status='RUNNING', detail='recovered after cancelled safe deploy', updated_at=? WHERE id=?",
+                          (now, job_id),
+                      )
+                      resumed.append((db.parent.name, job_id))
+                  conn.commit()
+              finally:
+                  conn.close()
+          for slug, job_id in resumed:
+              print(f"resumed {slug} {job_id}")
+          print(f"resumed_count={len(resumed)}")
+          PY
