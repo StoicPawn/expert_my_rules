@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from .base import ModelProvider
+from .runtime_progress import clear_progress, set_progress
 
 
 class OllamaLivenessError(RuntimeError):
@@ -70,8 +71,6 @@ class OllamaProvider(ModelProvider):
             response.raise_for_status()
             return True
         except Exception:
-            # `/api/version` gives a second fixed, cheap liveness probe for older
-            # Ollama versions or transient `/api/ps` errors.
             try:
                 response = httpx.get(f'{self.base_url}/api/version', timeout=self.health_timeout)
                 response.raise_for_status()
@@ -145,9 +144,15 @@ class OllamaProvider(ModelProvider):
                 'health_failures': health_failures,
                 **extra,
             }
+            set_progress(self.model, payload_event)
             self._emit_progress(payload_event)
             last_progress_event = now
 
+        set_progress(self.model, {
+            'state': 'starting', 'model': self.model, 'elapsed_seconds': 0.0,
+            'chunks': 0, 'output_chars': 0, 'thinking_chars': 0,
+            'last_stream_activity_seconds': 0.0, 'health_failures': 0,
+        })
         try:
             while True:
                 try:
@@ -210,3 +215,4 @@ class OllamaProvider(ModelProvider):
                 except Exception:
                     pass
             thread.join(timeout=2.0)
+            clear_progress(self.model)
