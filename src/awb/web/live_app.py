@@ -183,6 +183,11 @@ def _candidate_review_html(root: Path, ledger: Ledger, current_task_id: str | No
     for task in tasks:
         work_event = latest_work.get(task.id)
         review_event = latest_review.get(task.id)
+        # A task may have several scientific attempts. Never attach an objection
+        # from an older attempt to a newer Worker candidate that is still under
+        # review. The durable event sequence gives us the exact causal ordering.
+        if work_event and review_event and int(review_event.get('seq', 0)) <= int(work_event.get('seq', 0)):
+            review_event = None
         artifact_text = '' if work_event else _artifact_fallback(root, task)
         if not work_event and not review_event and not artifact_text:
             continue
@@ -209,7 +214,7 @@ def _candidate_review_html(root: Path, ledger: Ledger, current_task_id: str | No
         elif review_event:
             objection_html = "<div class='muted'>No critical objections in the latest persisted Reviewer result.</div>"
         else:
-            objection_html = "<div class='muted'>The candidate is persisted; the Reviewer has not persisted a result yet.</div>"
+            objection_html = "<div class='muted'>The candidate is persisted; the Reviewer has not persisted a result for this candidate yet.</div>"
 
         recommendation_html = ''
         if recommendations:
