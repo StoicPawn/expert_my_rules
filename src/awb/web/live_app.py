@@ -137,6 +137,107 @@ def _progress_html() -> str:
     )
 
 
+def _text(value: object) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value.strip()
+    return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+def _artifact_fallback(root: Path, task) -> str:
+    relative = str(task.metadata.get('artifact') or '').strip()
+    if not relative:
+        return ''
+    try:
+        root_resolved = root.resolve()
+        path = (root / relative).resolve()
+        if root_resolved not in path.parents or not path.is_file():
+            return ''
+        return path.read_text(encoding='utf-8', errors='replace')
+    except (OSError, ValueError):
+        return ''
+
+
+def _candidate_review_html(root: Path, ledger: Ledger, current_task_id: str | None = None) -> str:
+    # One WAL-safe read snapshot. Events are returned newest first, so the first
+    # work/review event per task is the latest persisted result. No status or task
+    # mutation happens here: this endpoint is intentionally observational only.
+    events = ledger.recent_events(1000)
+    latest_work: dict[str, dict] = {}
+    latest_review: dict[str, dict] = {}
+    for event in events:
+        task_id = event.get('task_id')
+        if not task_id:
+            continue
+        if event.get('kind') == 'work_output' and task_id not in latest_work:
+            latest_work[task_id] = event
+        elif event.get('kind') == 'review' and task_id not in latest_review:
+            latest_review[task_id] = event
+
+    tasks = ledger.list_tasks()
+    if current_task_id:
+        tasks.sort(key=lambda t: 0 if t.id == current_task_id else 1)
+
+    cards: list[str] = []
+    for task in tasks:
+        work_event = latest_work.get(task.id)
+        review_event = latest_review.get(task.id)
+        artifact_text = '' if work_event else _artifact_fallback(root, task)
+        if not work_event and not review_event and not artifact_text:
+            continue
+
+        work_payload = (work_event or {}).get('payload') or {}
+        review_payload = (review_event or {}).get('payload') or {}
+        candidate = _text(work_payload.get('text')) or artifact_text
+        stage = _text(work_payload.get('stage'))
+        approved = review_payload.get('approved') if review_event else None
+        objections = review_payload.get('critical_objections') or []
+        recommendations = review_payload.get('recommendations') or []
+
+        if approved is True:
+            review_state = "<span class='inspection-pill ok'>approved</span>"
+        elif approved is False:
+            review_state = "<span class='inspection-pill warn'>challenged</span>"
+        else:
+            review_state = "<span class='inspection-pill active'>review pending / not yet persisted</span>"
+
+        if objections:
+            objection_html = "<ol class='inspection-objections'>" + ''.join(
+                f"<li>{html.escape(_text(item))}</li>" for item in objections
+            ) + "</ol>"
+        elif review_event:
+            objection_html = "<div class='muted'>No critical objections in the latest persisted Reviewer result.</div>"
+        else:
+            objection_html = "<div class='muted'>The candidate is persisted; the Reviewer has not persisted a result yet.</div>"
+
+        recommendation_html = ''
+        if recommendations:
+            recommendation_html = (
+                "<h4>Reviewer recommendations</h4><ul class='inspection-objections'>"
+                + ''.join(f"<li>{html.escape(_text(item))}</li>" for item in recommendations)
+                + "</ul>"
+            )
+
+        source_label = f"Worker stage: {html.escape(stage)}" if stage else "Persisted attempt artifact"
+        cards.append(
+            "<details class='inspection-card'" + (" open" if task.id == current_task_id else "") + ">"
+            f"<summary><b>{html.escape(task.title)}</b> <span class='muted'>({html.escape(task.id)})</span> {review_state}</summary>"
+            "<div class='inspection-body'>"
+            f"<div class='muted inspection-source'>{source_label}</div>"
+            "<h4>Full Worker candidate</h4>"
+            f"<pre class='inspection-text'>{html.escape(candidate)}</pre>"
+            "<h4>Latest Reviewer objections</h4>"
+            f"{objection_html}{recommendation_html}"
+            "<p class='muted inspection-note'>Read-only view from the persistent ledger/artifact store. Opening or refreshing it does not pause, restart, change task state, or consume a scientific attempt.</p>"
+            "</div></details>"
+        )
+
+    if not cards:
+        return "<div class='muted'>No persisted Worker candidate or Reviewer result is available yet.</div>"
+    return ''.join(cards)
+
+
 def _render_activity(slug: str) -> str:
     root = base_dir() / slug
     if not (root / "project.yaml").exists():
@@ -173,11 +274,23 @@ def project_activity(slug: str):
     return HTMLResponse(_render_activity(unquote(slug)))
 
 
+@app.get("/project/{slug}/inspection", response_class=HTMLResponse)
+def project_inspection(slug: str):
+    root = base_dir() / unquote(slug)
+    if not (root / "project.yaml").exists():
+        raise HTTPException(404, "Project not found")
+    ledger = Ledger(root / "ledger.sqlite3")
+    current = next((t for t in ledger.list_tasks() if t.status == TaskStatus.IN_PROGRESS), None)
+    return HTMLResponse(_candidate_review_html(root, ledger, current.id if current else None))
+
+
 INJECTION = r"""
 <style>
 #live-activity-card{border:1px solid #dedee5}.live-current{display:flex;gap:12px;align-items:center;padding:12px 14px;background:#f4f7ff;border-radius:12px;margin-bottom:12px}.live-current.idle{background:#f3f3f5}.live-pulse{width:11px;height:11px;border-radius:50%;background:#2563eb;box-shadow:0 0 0 0 rgba(37,99,235,.5);animation:livepulse 1.6s infinite}@keyframes livepulse{70%{box-shadow:0 0 0 10px rgba(37,99,235,0)}100%{box-shadow:0 0 0 0 rgba(37,99,235,0)}}.live-runtime{padding:10px 14px;border-radius:10px;margin:-4px 0 12px 0;background:#f7f7f8;font-size:14px;line-height:1.35}.live-runtime.ok b{color:#087c35}.live-runtime.warn b{color:#9a5200}.live-runtime.active b{color:#1d4ed8}.live-feed{max-height:430px;overflow:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}.live-row{display:grid;grid-template-columns:70px 1fr;gap:10px;padding:10px 4px;border-bottom:1px solid #eee}.live-time{font-variant-numeric:tabular-nums;color:#777;font-size:13px}.live-detail{color:#555;margin-top:3px;line-height:1.35}.live-row.active b{color:#1d4ed8}.live-row.ok b{color:#087c35}.live-row.warn b{color:#9a5200}.live-row.error b{color:#a11b1b}
+#candidate-review-card{border:1px solid #dedee5}.inspection-card{border:1px solid #e4e4e8;border-radius:12px;margin:10px 0;background:#fff}.inspection-card summary{cursor:pointer;padding:12px 14px;line-height:1.4}.inspection-body{padding:0 14px 14px}.inspection-source{font-size:12px;margin-top:2px}.inspection-text{white-space:pre-wrap;word-break:break-word;max-height:560px;overflow:auto;background:#f7f7f8;padding:12px;border-radius:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;line-height:1.45;-webkit-overflow-scrolling:touch}.inspection-objections{padding-left:22px}.inspection-objections li{margin:8px 0}.inspection-pill{display:inline-block;margin-left:6px;padding:2px 7px;border-radius:999px;font-size:11px;font-weight:600}.inspection-pill.ok{background:#e9f8ef;color:#087c35}.inspection-pill.warn{background:#fff2df;color:#8a4a00}.inspection-pill.active{background:#eef3ff;color:#1d4ed8}.inspection-note{font-size:12px;margin-top:12px}
 </style>
 <div class='panel' id='live-activity-card'><h2>Live activity</h2><p class='muted'>Plain-language activity from the Director, Worker, Reviewer, Verifier and tools. Updates automatically while the project runs.</p><div id='live-activity'><div class='muted'>Loading activity…</div></div></div>
+<div class='panel' id='candidate-review-card'><h2>Candidate & review inspector</h2><p class='muted'>Read-only access to the full persisted Worker candidate and the latest Reviewer objections. It does not pause or alter the autonomous cycle.</p><div id='candidate-review-inspector'><div class='muted'>Loading persisted candidate/review data…</div></div></div>
 <script>
 (function(){
  const parts=window.location.pathname.split('/').filter(Boolean);
@@ -209,7 +322,31 @@ INJECTION = r"""
      if(!lastHtml) host.innerHTML='<div class="muted">Activity feed temporarily unavailable.</div>';
    }finally{refreshing=false;}
  }
- refreshActivity(); setInterval(refreshActivity,2000);
+ let inspectRefreshing=false;
+ let inspectLast='';
+ async function refreshInspection(){
+   if(inspectRefreshing) return;
+   inspectRefreshing=true;
+   const host=document.getElementById('candidate-review-inspector');
+   if(!host){inspectRefreshing=false;return;}
+   const openIds=Array.from(host.querySelectorAll('details[open]')).map(d=>d.querySelector('summary')?.textContent || '');
+   const oldScrolls=Array.from(host.querySelectorAll('.inspection-text')).map(x=>x.scrollTop);
+   try{
+     const r=await fetch('/project/'+slug+'/inspection',{cache:'no-store'});
+     if(!r.ok) return;
+     const next=await r.text();
+     if(next===inspectLast) return;
+     inspectLast=next;
+     host.innerHTML=next;
+     Array.from(host.querySelectorAll('details')).forEach(d=>{const s=d.querySelector('summary');if(s && openIds.includes(s.textContent || ''))d.open=true;});
+     Array.from(host.querySelectorAll('.inspection-text')).forEach((x,i)=>{if(oldScrolls[i]!==undefined)x.scrollTop=oldScrolls[i];});
+   }catch(e){
+     if(!inspectLast) host.innerHTML='<div class="muted">Inspection data temporarily unavailable.</div>';
+   }finally{inspectRefreshing=false;}
+ }
+ refreshActivity(); refreshInspection();
+ setInterval(refreshActivity,2000);
+ setInterval(refreshInspection,15000);
 })();
 </script>
 """
