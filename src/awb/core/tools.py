@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .models import Workspace
+from .research_lab import ResearchLabError
 from .science_tools import (
     ScienceToolError,
     counterexample_search,
