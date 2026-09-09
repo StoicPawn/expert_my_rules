@@ -11,6 +11,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from awb.core.models import TaskStatus
 from awb.core.storage import Ledger
+from awb.providers.runtime_progress import get_progress
 from awb.web.app import app, base_dir
 
 
@@ -96,6 +97,46 @@ def _human_event(event: dict, ledger: Ledger) -> tuple[str, str, str]:
     return "info", kind.replace("_", " ").title(), json.dumps(payload, ensure_ascii=False)[:300]
 
 
+def _format_elapsed(seconds: object) -> str:
+    try:
+        total = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        return '?'
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f'{hours:d}:{minutes:02d}:{secs:02d}' if hours else f'{minutes:d}:{secs:02d}'
+
+
+def _progress_html() -> str:
+    progress = get_progress()
+    if not progress:
+        return ''
+    state = str(progress.get('state') or 'generating')
+    elapsed = _format_elapsed(progress.get('elapsed_seconds'))
+    chunks = int(progress.get('chunks') or 0)
+    output_chars = int(progress.get('output_chars') or 0)
+    silent = _format_elapsed(progress.get('last_stream_activity_seconds'))
+    model = html.escape(str(progress.get('model') or 'local model'))
+    failures = int(progress.get('health_failures') or 0)
+    if state == 'health_check_failed':
+        status = f'health probe failed ({failures}); watchdog is still checking'
+        cls = 'warn'
+    elif state == 'alive':
+        status = f'no recent chunk for {silent}, but Ollama is healthy — continuing without a total timeout'
+        cls = 'ok'
+    elif state == 'starting':
+        status = 'request accepted; waiting for streamed output'
+        cls = 'active'
+    else:
+        status = 'stream is producing activity'
+        cls = 'ok'
+    return (
+        f"<div class='live-runtime {cls}'><b>Local model liveness</b><br>"
+        f"{model} · elapsed {html.escape(elapsed)} · chunks {chunks} · visible output {output_chars} chars<br>"
+        f"<span class='muted'>{html.escape(status)}</span></div>"
+    )
+
+
 def _render_activity(slug: str) -> str:
     root = base_dir() / slug
     if not (root / "project.yaml").exists():
@@ -107,9 +148,9 @@ def _render_activity(slug: str) -> str:
     recent = list(reversed(ledger.recent_events(35)))
 
     if current:
-        headline = f"<div class='live-current'><span class='live-pulse'></span><div><b>Now working on</b><br>{html.escape(current.title)} <span class='muted'>({html.escape(current.id)})</span></div></div>"
+        headline = f"<div class='live-current'><span class='live-pulse'></span><div><b>Now working on</b><br>{html.escape(current.title)} <span class='muted'>({html.escape(current.id)})</span></div></div>" + _progress_html()
     elif job and job.get("status") == "RUNNING":
-        headline = "<div class='live-current'><span class='live-pulse'></span><div><b>Project is active</b><br><span class='muted'>Preparing or selecting the next step.</span></div></div>"
+        headline = "<div class='live-current'><span class='live-pulse'></span><div><b>Project is active</b><br><span class='muted'>Preparing or selecting the next step.</span></div></div>" + _progress_html()
     else:
         headline = "<div class='live-current idle'><div><b>No agent is currently executing</b><br><span class='muted'>Activity history remains available below.</span></div></div>"
 
@@ -134,7 +175,7 @@ def project_activity(slug: str):
 
 INJECTION = r"""
 <style>
-#live-activity-card{border:1px solid #dedee5}.live-current{display:flex;gap:12px;align-items:center;padding:12px 14px;background:#f4f7ff;border-radius:12px;margin-bottom:12px}.live-current.idle{background:#f3f3f5}.live-pulse{width:11px;height:11px;border-radius:50%;background:#2563eb;box-shadow:0 0 0 0 rgba(37,99,235,.5);animation:livepulse 1.6s infinite}@keyframes livepulse{70%{box-shadow:0 0 0 10px rgba(37,99,235,0)}100%{box-shadow:0 0 0 0 rgba(37,99,235,0)}}.live-feed{max-height:430px;overflow:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}.live-row{display:grid;grid-template-columns:70px 1fr;gap:10px;padding:10px 4px;border-bottom:1px solid #eee}.live-time{font-variant-numeric:tabular-nums;color:#777;font-size:13px}.live-detail{color:#555;margin-top:3px;line-height:1.35}.live-row.active b{color:#1d4ed8}.live-row.ok b{color:#087c35}.live-row.warn b{color:#9a5200}.live-row.error b{color:#a11b1b}
+#live-activity-card{border:1px solid #dedee5}.live-current{display:flex;gap:12px;align-items:center;padding:12px 14px;background:#f4f7ff;border-radius:12px;margin-bottom:12px}.live-current.idle{background:#f3f3f5}.live-pulse{width:11px;height:11px;border-radius:50%;background:#2563eb;box-shadow:0 0 0 0 rgba(37,99,235,.5);animation:livepulse 1.6s infinite}@keyframes livepulse{70%{box-shadow:0 0 0 10px rgba(37,99,235,0)}100%{box-shadow:0 0 0 0 rgba(37,99,235,0)}}.live-runtime{padding:10px 14px;border-radius:10px;margin:-4px 0 12px 0;background:#f7f7f8;font-size:14px;line-height:1.35}.live-runtime.ok b{color:#087c35}.live-runtime.warn b{color:#9a5200}.live-runtime.active b{color:#1d4ed8}.live-feed{max-height:430px;overflow:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}.live-row{display:grid;grid-template-columns:70px 1fr;gap:10px;padding:10px 4px;border-bottom:1px solid #eee}.live-time{font-variant-numeric:tabular-nums;color:#777;font-size:13px}.live-detail{color:#555;margin-top:3px;line-height:1.35}.live-row.active b{color:#1d4ed8}.live-row.ok b{color:#087c35}.live-row.warn b{color:#9a5200}.live-row.error b{color:#a11b1b}
 </style>
 <div class='panel' id='live-activity-card'><h2>Live activity</h2><p class='muted'>Plain-language activity from the Director, Worker, Reviewer, Verifier and tools. Updates automatically while the project runs.</p><div id='live-activity'><div class='muted'>Loading activity…</div></div></div>
 <script>
