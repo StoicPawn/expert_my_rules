@@ -8,6 +8,15 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .models import Workspace
+from .research_lab import ResearchLabError
+from .science_tools import (
+    ScienceToolError,
+    counterexample_search,
+    literature_search,
+    research_lab,
+    symbolic_math,
+    tutor_knowledge,
+)
 
 
 class ToolError(RuntimeError):
@@ -21,9 +30,9 @@ class ToolRunner:
     worktree while the canonical project workspace and ledger remain untouched.
 
     Repository-intelligence tools intentionally use Python filesystem primitives
-    rather than arbitrary shell commands. This keeps them portable to Windows and
-    gives small local models compact, targeted context instead of forcing them to
-    read/rewrite entire repositories.
+    rather than arbitrary shell commands. Scientific tools are thin, typed adapters:
+    compute is delegated to the standalone Research Lab, library knowledge remains in
+    Tutor LLM, and external literature discovery uses fixed metadata services.
     """
 
     IGNORED_DIR_NAMES = {
@@ -84,6 +93,49 @@ class ToolRunner:
                 item["fixed_command"] = spec.command
             elif spec.type in {"git_status", "git_diff"}:
                 item["arguments"] = {}
+            elif spec.type == 'research_lab':
+                item['arguments'] = {
+                    'action': 'capabilities|list_workspaces|list_runs|latest_context|run|publish_context',
+                    'project_key': 'stable project key',
+                    'code': 'Python code for action=run',
+                    'title': 'optional experiment title',
+                    'timeout_seconds': '1..300 for action=run',
+                    'content': 'context text for action=publish_context',
+                    'sources': 'optional provenance list',
+                }
+            elif spec.type == 'symbolic_math':
+                item['arguments'] = {
+                    'expression': 'SymPy expression string',
+                    'operation': 'simplify|factor|expand|solve|diff|integrate|limit|series',
+                    'variable': 'symbol name, default x',
+                    'point': 'required for limit; optional series expansion point',
+                    'order': 'series order, 1..30',
+                    'project_key': 'optional shared Research Lab key',
+                }
+            elif spec.type == 'counterexample_search':
+                item['arguments'] = {
+                    'expression': 'scalar expression in named variables',
+                    'variables': {'x': ['low', 'high']},
+                    'predicate': 'eq_zero|nonnegative|nonpositive|positive|finite',
+                    'samples': '10..50000',
+                    'seed': 'integer',
+                    'tolerance': 'numeric tolerance',
+                    'project_key': 'optional shared Research Lab key',
+                }
+            elif spec.type == 'literature_search':
+                item['arguments'] = {
+                    'query': 'bibliographic/topic query',
+                    'max_results': '1..10 per source',
+                    'sources': ['crossref', 'arxiv'],
+                }
+            elif spec.type == 'tutor_knowledge':
+                item['arguments'] = {
+                    'action': 'list_workspaces|documents|retrieve|knowledge_graph',
+                    'workspace_id': 'required except list_workspaces',
+                    'query': 'required for retrieve',
+                    'document_ids': 'optional document filter',
+                    'top_k': '1..20 for retrieve',
+                }
             out.append(item)
         return out
 
@@ -129,7 +181,6 @@ class ToolRunner:
             current_path = Path(current)
             for name in sorted(files):
                 path = current_path / name
-                # A file symlink may still point outside the worktree.
                 try:
                     resolved = path.resolve()
                 except OSError:
@@ -377,6 +428,20 @@ class ToolRunner:
             return self._git('diff', '--stat', 'HEAD') | {
                 'patch': self._git('diff', '--no-ext-diff', 'HEAD')['stdout'][-60_000:]
             }
+
+        try:
+            if spec.type == 'research_lab':
+                return research_lab(arguments)
+            if spec.type == 'symbolic_math':
+                return symbolic_math(arguments)
+            if spec.type == 'counterexample_search':
+                return counterexample_search(arguments)
+            if spec.type == 'literature_search':
+                return literature_search(arguments)
+            if spec.type == 'tutor_knowledge':
+                return tutor_knowledge(arguments)
+        except (ScienceToolError, ResearchLabError) as exc:
+            raise ToolError(str(exc)) from exc
 
         raise ToolError(f"Unsupported tool type: {spec.type}")
 
