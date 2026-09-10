@@ -7,8 +7,8 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Current promotional API list prices in USD per million tokens. Unknown models
-# fail closed for budget reservation unless explicitly configured via environment.
+# Current GPT-5.6 Sol promotional API price plus the published Terra/Luna rates,
+# in USD per million tokens. Unknown models fail closed unless overridden.
 PRICE_USD_PER_MTOK = {
     'gpt-5.6-sol': (4.0, 20.0),
     'gpt-5.6': (4.0, 20.0),
@@ -28,7 +28,9 @@ ROLE_DEFAULTS = {
 class CloudBurstControl:
     enabled: bool = False
     budget_eur: float = 5.0
-    priority_threshold: float = 7.0
+    # 1.0 means the burst covers normal task work by default. Raise this to keep
+    # routine low-priority tasks local while still cloud-routing blockers/retries.
+    priority_threshold: float = 1.0
     roles: tuple[str, ...] = ('director', 'worker', 'reviewer', 'verifier')
     started_at: str = ''
     note: str = 'Cloud burst applies at the next model-call boundary; an in-flight local call is never killed.'
@@ -56,7 +58,7 @@ def load_control(root: Path) -> CloudBurstControl:
         return CloudBurstControl(
             enabled=bool(raw.get('enabled', False)),
             budget_eur=float(raw.get('budget_eur', 5.0)),
-            priority_threshold=float(raw.get('priority_threshold', 7.0)),
+            priority_threshold=float(raw.get('priority_threshold', 1.0)),
             roles=roles or CloudBurstControl().roles,
             started_at=str(raw.get('started_at') or ''),
             note=str(raw.get('note') or CloudBurstControl().note),
@@ -101,7 +103,15 @@ def cost_from_usage(model: str, input_tokens: int, output_tokens: int) -> tuple[
     if not price:
         raise ValueError(f'No budget price configured for {model}')
     input_price, output_price = price
-    usd = max(0, int(input_tokens)) * input_price / 1_000_000 + max(0, int(output_tokens)) * output_price / 1_000_000
+    it = max(0, int(input_tokens))
+    ot = max(0, int(output_tokens))
+    # GPT-5.6 Sol long-context requests above 272K input tokens are billed at
+    # 2x input and 1.5x output for the whole request. Applying the multiplier to
+    # the gpt-5.6 alias too keeps the meter conservative.
+    if model in {'gpt-5.6-sol', 'gpt-5.6'} and it > 272_000:
+        input_price *= 2.0
+        output_price *= 1.5
+    usd = it * input_price / 1_000_000 + ot * output_price / 1_000_000
     return usd, usd / usd_per_eur()
 
 
@@ -172,7 +182,7 @@ def budget_snapshot(root: Path) -> dict:
         'started_at': control.started_at,
         'priority_threshold': control.priority_threshold,
         'roles': list(control.roles),
-        'api_key_configured': bool(os.getenv('OPENAI_API_KEY')),
+        'api_key_configured': bool(os.getenv('OPENAI_API_KEY') or os.getenv('AWB_OPENAI_KEY_PRESENT')),
         'role_models': {role: role_cloud_config(role) for role in control.roles},
         'note': control.note,
     }
