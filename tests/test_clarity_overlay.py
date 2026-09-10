@@ -60,7 +60,7 @@ class ClarityOverlayTests(unittest.TestCase):
     def test_overlay_moves_resource_and_clarity_cards_next_to_live_activity(self):
         injection = clarity_overlay.CLARITY_INJECTION
         self.assertIn("machine-resource-card", injection)
-        self.assertIn("history across all tasks", injection)
+        self.assertIn("History across all tasks", injection)
         self.assertIn("setInterval(refreshClarity,2000)", injection)
 
 
