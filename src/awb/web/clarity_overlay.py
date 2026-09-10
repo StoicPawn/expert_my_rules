@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import sqlite3
+import urllib.request
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -10,6 +12,7 @@ from fastapi.responses import HTMLResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from awb.web.app import app, base_dir
+from awb.web.resource_monitor import _gib, _resource_snapshot
 
 
 def _format_duration(seconds: object) -> str:
@@ -37,6 +40,46 @@ def _task_title(conn: sqlite3.Connection, task_id: str | None) -> str:
         return "project-wide"
     row = conn.execute("SELECT title FROM tasks WHERE id=?", (task_id,)).fetchone()
     return str(row["title"]) if row else task_id
+
+
+def _ollama_compute_placement() -> str:
+    base = os.environ.get("OLLAMA_BASE_URL", "http://ollama:11434").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/api/ps", timeout=1.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        models = payload.get("models") or []
+        if not models:
+            return "No Ollama model loaded"
+        item = models[0]
+        name = str(item.get("name") or item.get("model") or "model")
+        size = int(item.get("size") or 0)
+        size_vram = int(item.get("size_vram") or 0)
+        if size <= 0:
+            return f"{name} · compute placement unavailable"
+        gpu_share = min(100.0, max(0.0, size_vram * 100.0 / size))
+        cpu_share = 100.0 - gpu_share
+        return (
+            f"{name} · model placement ≈ {cpu_share:.0f}% CPU / {gpu_share:.0f}% GPU · "
+            f"VRAM {_gib(size_vram)}"
+        )
+    except Exception:
+        return "Ollama compute placement unavailable"
+
+
+def _machine_summary() -> str:
+    snap = _resource_snapshot()
+    ram_total = int(snap.get("ram_total") or 0)
+    ram_used = int(snap.get("ram_used") or 0)
+    ram_pct = snap.get("ram_percent")
+    cpu_pct = snap.get("cpu_percent")
+    if ram_total:
+        ram = f"{_gib(ram_used)} / {_gib(ram_total)}"
+        if ram_pct is not None:
+            ram += f" ({float(ram_pct):.0f}%)"
+    else:
+        ram = "unavailable"
+    cpu = "sampling…" if cpu_pct is None else f"{float(cpu_pct):.0f}%"
+    return f"RAM {ram} · CPU {cpu} · {_ollama_compute_placement()}"
 
 
 def _phase_from_events(events: list[sqlite3.Row], current_title: str) -> tuple[str, str]:
@@ -111,8 +154,6 @@ def _clarity_html(root: Path) -> str:
             phase, explanation = _phase_from_events(events, current_title)
             current_line = f"<b>{html.escape(current_id)} · {html.escape(current_title)}</b>"
         else:
-            current_id = None
-            current_title = ""
             phase = "No task is executing right now"
             explanation = "The project may be paused, between iterations, or already complete."
             current_line = "<b>None</b>"
@@ -135,12 +176,14 @@ def _clarity_html(root: Path) -> str:
 
         job_status = str(job["status"]) if job else "NOT STARTED"
         job_detail = str(job["detail"] or "") if job else ""
+        machine = _machine_summary()
         return (
             "<div class='clarity-current'>"
             "<div><span>Current task</span>" + current_line + "</div>"
             f"<div><span>What is happening now</span><b>{html.escape(phase)}</b><p>{html.escape(explanation)}</p></div>"
             f"<div><span>Project job</span><b>{html.escape(job_status)}</b><p>{html.escape(job_detail)}</p></div>"
             f"<div><span>Most recent completed model call</span>{last_call_html}</div>"
+            f"<div class='clarity-machine'><span>Machine now</span><b>{html.escape(machine)}</b><p>CPU/GPU percentages for Ollama describe where model memory is placed, not instantaneous GPU utilisation.</p></div>"
             "</div>"
             "<p class='clarity-note'><b>Important:</b> the activity feed below is a history across tasks. An older line about SEED-0001 can remain visible while SEED-0005 is the task currently executing.</p>"
         )
@@ -158,9 +201,9 @@ def project_what_is_happening(slug: str):
 
 CLARITY_INJECTION = r"""
 <style>
-#clarity-card{border:1px solid #dedee5}.clarity-current{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.clarity-current>div{background:#f7f7f8;border-radius:10px;padding:11px 12px;min-width:0}.clarity-current span{display:block;color:#666;font-size:12px;margin-bottom:4px}.clarity-current b{display:block;overflow-wrap:anywhere}.clarity-current p{margin:5px 0 0;line-height:1.4;color:#555}.clarity-note{font-size:13px;line-height:1.45;background:#fff7e8;border-radius:10px;padding:10px 12px;margin:10px 0 0}@media(max-width:640px){.clarity-current{grid-template-columns:1fr}}
+#clarity-card{border:1px solid #dedee5}.clarity-current{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.clarity-current>div{background:#f7f7f8;border-radius:10px;padding:11px 12px;min-width:0}.clarity-current .clarity-machine{grid-column:1/-1}.clarity-current span{display:block;color:#666;font-size:12px;margin-bottom:4px}.clarity-current b{display:block;overflow-wrap:anywhere}.clarity-current p{margin:5px 0 0;line-height:1.4;color:#555}.clarity-note{font-size:13px;line-height:1.45;background:#fff7e8;border-radius:10px;padding:10px 12px;margin:10px 0 0}@media(max-width:640px){.clarity-current{grid-template-columns:1fr}.clarity-current .clarity-machine{grid-column:auto}}
 </style>
-<div class='panel' id='clarity-card'><h2>What is happening now?</h2><p class='muted'>Current task and current workflow phase, separated from historical activity.</p><div id='clarity-values'><div class='muted'>Loading current state…</div></div></div>
+<div class='panel' id='clarity-card'><h2>What is happening now?</h2><p class='muted'>Current task, current workflow phase and machine load, separated from historical activity.</p><div id='clarity-values'><div class='muted'>Loading current state…</div></div></div>
 <script>
 (function(){
  const parts=window.location.pathname.split('/').filter(Boolean);
