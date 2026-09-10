@@ -211,7 +211,13 @@ CLARITY_INJECTION = r"""
  const slug=encodeURIComponent(parts[1]);
  const card=document.getElementById('clarity-card');
  const live=document.getElementById('live-activity-card');
- if(card && live && live.parentNode) live.parentNode.insertBefore(card,live);
+ const resources=document.getElementById('machine-resource-card');
+ if(live && live.parentNode){
+   if(card) live.parentNode.insertBefore(card,live);
+   if(resources) live.parentNode.insertBefore(resources,live);
+   const p=live.querySelector('p.muted');
+   if(p) p.textContent='History across all tasks. Use the panel above for the task and phase that are active right now.';
+ }
  let busy=false,last='';
  async function refreshClarity(){
    if(busy) return; busy=true;
