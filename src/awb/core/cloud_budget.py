@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,20 +28,42 @@ class CloudBurstControl:
     budget_eur: float = 5.0
     priority_threshold: float = 1.0
     roles: tuple[str, ...] = ('director', 'worker', 'reviewer', 'verifier')
+    role_models: dict[str, dict] = field(default_factory=dict)
     started_at: str = ''
-    note: str = 'Cloud burst applies at the next model-call boundary; an in-flight local call is never killed.'
+    note: str = 'Cloud calls are metered and fall back to local inference when a project or monthly ceiling is exhausted.'
 
     def normalized(self) -> 'CloudBurstControl':
         self.budget_eur = max(0.0, float(self.budget_eur))
         self.priority_threshold = max(0.0, float(self.priority_threshold))
         self.roles = tuple(str(r) for r in self.roles if str(r))
+        self.role_models = {
+            str(role): dict(cfg)
+            for role, cfg in (self.role_models or {}).items()
+            if isinstance(cfg, dict)
+        }
         if self.enabled and not self.started_at:
             self.started_at = datetime.now(timezone.utc).isoformat()
         return self
 
 
+@dataclass
+class GlobalCloudControl:
+    enabled: bool = True
+    monthly_budget_eur: float = 5.0
+    hard_stop: bool = True
+    note: str = 'Hard monthly ceiling across all Expert My Rules projects. When exhausted, paid APIs are blocked and local routes remain available.'
+
+    def normalized(self) -> 'GlobalCloudControl':
+        self.monthly_budget_eur = max(0.0, float(self.monthly_budget_eur))
+        return self
+
+
 def control_path(root: Path) -> Path:
     return root / '.awb' / 'cloud_burst.json'
+
+
+def global_control_path(root: Path) -> Path:
+    return root.parent / '.awb' / 'global_cloud.json'
 
 
 def load_control(root: Path) -> CloudBurstControl:
@@ -56,6 +78,7 @@ def load_control(root: Path) -> CloudBurstControl:
             budget_eur=float(raw.get('budget_eur', 5.0)),
             priority_threshold=float(raw.get('priority_threshold', 1.0)),
             roles=roles or CloudBurstControl().roles,
+            role_models=dict(raw.get('role_models') or {}),
             started_at=str(raw.get('started_at') or ''),
             note=str(raw.get('note') or CloudBurstControl().note),
         ).normalized()
@@ -69,6 +92,36 @@ def save_control(root: Path, control: CloudBurstControl, *, reset_meter: bool = 
     control = control.normalized()
     if reset_meter or (control.enabled and not control.started_at):
         control.started_at = datetime.now(timezone.utc).isoformat()
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(asdict(control), indent=2, ensure_ascii=False), encoding='utf-8')
+    tmp.replace(path)
+    return control
+
+
+def load_global_control(root: Path) -> GlobalCloudControl:
+    path = global_control_path(root)
+    if not path.exists():
+        try:
+            default = float(os.getenv('AWB_MONTHLY_API_BUDGET_EUR', '5.0'))
+        except ValueError:
+            default = 5.0
+        return GlobalCloudControl(monthly_budget_eur=default)
+    try:
+        raw = json.loads(path.read_text(encoding='utf-8'))
+        return GlobalCloudControl(
+            enabled=bool(raw.get('enabled', True)),
+            monthly_budget_eur=float(raw.get('monthly_budget_eur', 5.0)),
+            hard_stop=bool(raw.get('hard_stop', True)),
+            note=str(raw.get('note') or GlobalCloudControl().note),
+        ).normalized()
+    except Exception:
+        return GlobalCloudControl(enabled=True, monthly_budget_eur=0.0, hard_stop=True)
+
+
+def save_global_control(root: Path, control: GlobalCloudControl) -> GlobalCloudControl:
+    control = control.normalized()
+    path = global_control_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(asdict(control), indent=2, ensure_ascii=False), encoding='utf-8')
     tmp.replace(path)
@@ -100,8 +153,6 @@ def cost_from_usage(model: str, input_tokens: int, output_tokens: int) -> tuple[
     input_price, output_price = price
     it = max(0, int(input_tokens))
     ot = max(0, int(output_tokens))
-    # Published GPT-5.6 long-context pricing uses 2x input and 1.5x output above
-    # 272K input tokens. Apply it across the family so the guard errs high.
     if model.startswith('gpt-5.6') and it > 272_000:
         input_price *= 2.0
         output_price *= 1.5
@@ -110,7 +161,7 @@ def cost_from_usage(model: str, input_tokens: int, output_tokens: int) -> tuple[
 
 
 def reserve_cost_eur(model: str, system: str, user: str, max_output_tokens: int) -> float:
-    """Pre-flight upper bound: UTF-8 bytes upper-bound tokenizer token count."""
+    """Conservative pre-flight upper bound used by the hard budget guard."""
     approx_input_tokens = max(1, len((system + '\n' + user).encode('utf-8')) + 64)
     try:
         _, eur = cost_from_usage(model, approx_input_tokens, max_output_tokens)
@@ -119,7 +170,7 @@ def reserve_cost_eur(model: str, system: str, user: str, max_output_tokens: int)
         return float('inf')
 
 
-def role_cloud_config(role: str) -> dict:
+def role_cloud_config(role: str, root: Path | None = None) -> dict:
     base = dict(ROLE_DEFAULTS.get(role, ROLE_DEFAULTS['worker']))
     prefix = f'AWB_OPENAI_{role.upper()}'
     base['model'] = os.getenv(f'{prefix}_MODEL', base['model'])
@@ -128,6 +179,17 @@ def role_cloud_config(role: str) -> dict:
         base['max_output_tokens'] = max(1, int(os.getenv(f'{prefix}_MAX_OUTPUT_TOKENS', str(base['max_output_tokens']))))
     except ValueError:
         pass
+    if root is not None:
+        override = load_control(root).role_models.get(role) or {}
+        if override.get('model'):
+            base['model'] = str(override['model'])
+        if override.get('reasoning'):
+            base['reasoning'] = str(override['reasoning'])
+        if override.get('max_output_tokens'):
+            try:
+                base['max_output_tokens'] = max(1, int(override['max_output_tokens']))
+            except (TypeError, ValueError):
+                pass
     return base
 
 
@@ -153,6 +215,8 @@ def cloud_spend(root: Path, started_at: str = '') -> dict:
             totals['output_tokens'] += int(p.get('output_tokens') or 0)
             totals['cost_usd'] += float(p.get('cost_usd') or 0.0)
             totals['cost_eur'] += float(p.get('cost_eur') or 0.0)
+    except sqlite3.DatabaseError:
+        pass
     finally:
         conn.close()
     totals['cost_usd'] = round(totals['cost_usd'], 6)
@@ -160,15 +224,55 @@ def cloud_spend(root: Path, started_at: str = '') -> dict:
     return totals
 
 
+def _month_start() -> str:
+    now = datetime.now(timezone.utc)
+    return datetime(now.year, now.month, 1, tzinfo=timezone.utc).isoformat()
+
+
+def global_month_spend(root: Path) -> dict:
+    total = {'calls': 0, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': 0.0, 'cost_eur': 0.0}
+    parent = root.parent
+    since = _month_start()
+    if not parent.exists():
+        return total
+    for candidate in parent.iterdir():
+        if not candidate.is_dir() or not (candidate / 'ledger.sqlite3').exists():
+            continue
+        snap = cloud_spend(candidate, since)
+        for key in ('calls', 'input_tokens', 'output_tokens'):
+            total[key] += int(snap[key])
+        for key in ('cost_usd', 'cost_eur'):
+            total[key] += float(snap[key])
+    total['cost_usd'] = round(total['cost_usd'], 6)
+    total['cost_eur'] = round(total['cost_eur'], 6)
+    return total
+
+
 def budget_snapshot(root: Path) -> dict:
     control = load_control(root)
     spend = cloud_spend(root, control.started_at)
-    remaining = max(0.0, control.budget_eur - float(spend['cost_eur']))
+    project_remaining = max(0.0, control.budget_eur - float(spend['cost_eur']))
+
+    global_control = load_global_control(root)
+    month = global_month_spend(root)
+    if global_control.enabled:
+        monthly_remaining = max(0.0, global_control.monthly_budget_eur - float(month['cost_eur']))
+    else:
+        monthly_remaining = float('inf')
+    effective_remaining = min(project_remaining, monthly_remaining)
+    hard_blocked = bool(
+        global_control.enabled
+        and global_control.hard_stop
+        and monthly_remaining <= 0
+    )
+
     return {
-        'enabled': control.enabled,
+        'enabled': control.enabled and not hard_blocked,
+        'requested_enabled': control.enabled,
         'budget_eur': control.budget_eur,
         'spent_eur': spend['cost_eur'],
-        'remaining_eur': round(remaining, 6),
+        'project_remaining_eur': round(project_remaining, 6),
+        'remaining_eur': round(max(0.0, effective_remaining), 6),
         'calls': spend['calls'],
         'input_tokens': spend['input_tokens'],
         'output_tokens': spend['output_tokens'],
@@ -176,6 +280,14 @@ def budget_snapshot(root: Path) -> dict:
         'priority_threshold': control.priority_threshold,
         'roles': list(control.roles),
         'api_key_configured': bool(os.getenv('OPENAI_API_KEY') or os.getenv('AWB_OPENAI_KEY_PRESENT')),
-        'role_models': {role: role_cloud_config(role) for role in control.roles},
+        'role_models': {role: role_cloud_config(role, root) for role in control.roles},
+        'monthly_budget_eur': global_control.monthly_budget_eur,
+        'monthly_spent_eur': month['cost_eur'],
+        'monthly_remaining_eur': None if monthly_remaining == float('inf') else round(monthly_remaining, 6),
+        'monthly_calls': month['calls'],
+        'hard_stop': global_control.hard_stop,
+        'hard_blocked': hard_blocked,
+        'global_enabled': global_control.enabled,
+        'month_start': _month_start(),
         'note': control.note,
     }
