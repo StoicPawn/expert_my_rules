@@ -7,8 +7,6 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Current GPT-5.6 Sol promotional API price plus the published Terra/Luna rates,
-# in USD per million tokens. Unknown models fail closed unless overridden.
 PRICE_USD_PER_MTOK = {
     'gpt-5.6-sol': (4.0, 20.0),
     'gpt-5.6': (4.0, 20.0),
@@ -28,8 +26,6 @@ ROLE_DEFAULTS = {
 class CloudBurstControl:
     enabled: bool = False
     budget_eur: float = 5.0
-    # 1.0 means the burst covers normal task work by default. Raise this to keep
-    # routine low-priority tasks local while still cloud-routing blockers/retries.
     priority_threshold: float = 1.0
     roles: tuple[str, ...] = ('director', 'worker', 'reviewer', 'verifier')
     started_at: str = ''
@@ -80,7 +76,6 @@ def save_control(root: Path, control: CloudBurstControl, *, reset_meter: bool = 
 
 
 def usd_per_eur() -> float:
-    """FX for the internal meter; 1.0 is intentionally conservative by default."""
     try:
         return max(0.01, float(os.getenv('AWB_USD_PER_EUR', '1.0')))
     except (TypeError, ValueError):
@@ -105,10 +100,9 @@ def cost_from_usage(model: str, input_tokens: int, output_tokens: int) -> tuple[
     input_price, output_price = price
     it = max(0, int(input_tokens))
     ot = max(0, int(output_tokens))
-    # GPT-5.6 Sol long-context requests above 272K input tokens are billed at
-    # 2x input and 1.5x output for the whole request. Applying the multiplier to
-    # the gpt-5.6 alias too keeps the meter conservative.
-    if model in {'gpt-5.6-sol', 'gpt-5.6'} and it > 272_000:
+    # Published GPT-5.6 long-context pricing uses 2x input and 1.5x output above
+    # 272K input tokens. Apply it across the family so the guard errs high.
+    if model.startswith('gpt-5.6') and it > 272_000:
         input_price *= 2.0
         output_price *= 1.5
     usd = it * input_price / 1_000_000 + ot * output_price / 1_000_000
@@ -116,8 +110,8 @@ def cost_from_usage(model: str, input_tokens: int, output_tokens: int) -> tuple[
 
 
 def reserve_cost_eur(model: str, system: str, user: str, max_output_tokens: int) -> float:
-    """Conservative pre-flight reserve so a new call cannot knowingly cross the cap."""
-    approx_input_tokens = max(1, (len(system) + len(user) + 2) // 3)
+    """Pre-flight upper bound: UTF-8 bytes upper-bound tokenizer token count."""
+    approx_input_tokens = max(1, len((system + '\n' + user).encode('utf-8')) + 64)
     try:
         _, eur = cost_from_usage(model, approx_input_tokens, max_output_tokens)
         return eur
@@ -138,7 +132,6 @@ def role_cloud_config(role: str) -> dict:
 
 
 def cloud_spend(root: Path, started_at: str = '') -> dict:
-    """Aggregate durable metered API calls from the project ledger."""
     db = root / 'ledger.sqlite3'
     totals = {'calls': 0, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': 0.0, 'cost_eur': 0.0}
     if not db.exists():
