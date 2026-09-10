@@ -62,8 +62,17 @@ def control_path(root: Path) -> Path:
     return root / '.awb' / 'cloud_burst.json'
 
 
+def _workspaces_root(root: Path) -> Path:
+    configured = os.getenv('AWB_WORKSPACES_DIR', '').strip()
+    if configured:
+        return Path(configured).resolve()
+    if root.parent.name == 'workspaces':
+        return root.parent
+    return root
+
+
 def global_control_path(root: Path) -> Path:
-    return root.parent / '.awb' / 'global_cloud.json'
+    return _workspaces_root(root) / '.awb' / 'global_cloud.json'
 
 
 def load_control(root: Path) -> CloudBurstControl:
@@ -161,7 +170,6 @@ def cost_from_usage(model: str, input_tokens: int, output_tokens: int) -> tuple[
 
 
 def reserve_cost_eur(model: str, system: str, user: str, max_output_tokens: int) -> float:
-    """Conservative pre-flight upper bound used by the hard budget guard."""
     approx_input_tokens = max(1, len((system + '\n' + user).encode('utf-8')) + 64)
     try:
         _, eur = cost_from_usage(model, approx_input_tokens, max_output_tokens)
@@ -231,12 +239,19 @@ def _month_start() -> str:
 
 def global_month_spend(root: Path) -> dict:
     total = {'calls': 0, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': 0.0, 'cost_eur': 0.0}
-    parent = root.parent
+    workspace_root = _workspaces_root(root)
     since = _month_start()
-    if not parent.exists():
-        return total
-    for candidate in parent.iterdir():
-        if not candidate.is_dir() or not (candidate / 'ledger.sqlite3').exists():
+    candidates = [root]
+    if workspace_root != root:
+        try:
+            candidates = list(workspace_root.iterdir())
+        except OSError:
+            candidates = [root]
+    for candidate in candidates:
+        try:
+            if not candidate.is_dir() or not (candidate / 'ledger.sqlite3').is_file():
+                continue
+        except OSError:
             continue
         snap = cloud_spend(candidate, since)
         for key in ('calls', 'input_tokens', 'output_tokens'):
@@ -252,7 +267,6 @@ def budget_snapshot(root: Path) -> dict:
     control = load_control(root)
     spend = cloud_spend(root, control.started_at)
     project_remaining = max(0.0, control.budget_eur - float(spend['cost_eur']))
-
     global_control = load_global_control(root)
     month = global_month_spend(root)
     if global_control.enabled:
@@ -260,12 +274,7 @@ def budget_snapshot(root: Path) -> dict:
     else:
         monthly_remaining = float('inf')
     effective_remaining = min(project_remaining, monthly_remaining)
-    hard_blocked = bool(
-        global_control.enabled
-        and global_control.hard_stop
-        and monthly_remaining <= 0
-    )
-
+    hard_blocked = bool(global_control.enabled and global_control.hard_stop and monthly_remaining <= 0)
     return {
         'enabled': control.enabled and not hard_blocked,
         'requested_enabled': control.enabled,
