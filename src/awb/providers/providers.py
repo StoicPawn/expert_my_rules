@@ -25,22 +25,38 @@ class MockProvider(ModelProvider):
 
 
 class OpenAIProvider(ModelProvider):
+    """Responses API provider with observable token usage.
+
+    Budget enforcement lives in the orchestrator. This provider exposes the exact
+    usage object returned by the API so the durable ledger can meter paid calls.
+    """
     def __init__(self, model: str, api_key: str | None = None, base_url: str | None = None):
         self.model = model
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+        self.max_output_tokens: int | None = None
+        self.reasoning_effort: str | None = None
+        self.last_usage: dict = {}
+        self.last_response_id: str | None = None
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is not set")
 
     def generate(self, system: str, user: str) -> str:
+        payload: dict = {"model": self.model, "instructions": system, "input": user}
+        if self.max_output_tokens:
+            payload["max_output_tokens"] = int(self.max_output_tokens)
+        if self.reasoning_effort:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
         r = httpx.post(
             f"{self.base_url}/responses",
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            json={"model": self.model, "instructions": system, "input": user},
+            json=payload,
             timeout=600,
         )
         r.raise_for_status()
         data = r.json()
+        self.last_usage = dict(data.get("usage") or {})
+        self.last_response_id = data.get("id")
         if data.get("output_text"):
             return data["output_text"]
         chunks = []
@@ -57,5 +73,5 @@ def make_provider(kind: str, model: str | None = None, base_url: str | None = No
     if kind == "ollama":
         return OllamaProvider(model or "qwen3:4b", base_url=base_url)
     if kind == "openai":
-        return OpenAIProvider(model or "gpt-5", base_url=base_url)
+        return OpenAIProvider(model or "gpt-5.6-sol", base_url=base_url)
     raise ValueError(f"Unknown provider: {kind}")
