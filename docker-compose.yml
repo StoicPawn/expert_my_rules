@@ -31,6 +31,7 @@ services:
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+      - AWB_RUNTIME_PROGRESS_FILE=/data/workspaces/.awb-runtime-progress.json
       - AWB_OLLAMA_READ_TIMEOUT_SECONDS=${AWB_OLLAMA_READ_TIMEOUT_SECONDS:-3600}
       - AWB_OLLAMA_STALL_CHECK_SECONDS=${AWB_OLLAMA_STALL_CHECK_SECONDS:-60}
       - AWB_OLLAMA_HEALTH_TIMEOUT_SECONDS=${AWB_OLLAMA_HEALTH_TIMEOUT_SECONDS:-5}
@@ -88,6 +89,7 @@ services:
       - ./workspaces:/data/workspaces
     environment:
       - AWB_WORKSPACES_DIR=/data/workspaces
+      - AWB_RUNTIME_PROGRESS_FILE=/data/workspaces/.awb-runtime-progress.json
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
       - AWB_RESOURCE_LABEL=${AWB_RESOURCE_LABEL:-ACEPC}
       - AWB_OPENAI_KEY_PRESENT=${OPENAI_API_KEY:+1}
