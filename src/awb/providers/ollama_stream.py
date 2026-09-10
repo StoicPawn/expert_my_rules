@@ -18,6 +18,12 @@ class OllamaLivenessError(RuntimeError):
 
 
 _END = object()
+_ROLE_TOKEN_DEFAULTS = {
+    'director': 1200,
+    'worker': 8192,
+    'reviewer': 2200,
+    'verifier': 1200,
+}
 
 
 def _env_float(name: str, default: float, low: float) -> float:
@@ -34,6 +40,13 @@ def _env_int(name: str, default: int, low: int) -> int:
         return default
 
 
+def _env_optional_bool(name: str) -> bool | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
 class OllamaProvider(ModelProvider):
     """Ollama chat provider optimized for very slow local hardware.
 
@@ -41,8 +54,9 @@ class OllamaProvider(ModelProvider):
     a watchdog observes liveness independently from speed. A slow generation may run
     for hours as long as the stream makes progress or Ollama remains healthy.
 
-    The watchdog never emits model text/thinking. It reports only operational
-    metadata, so the dashboard can distinguish "slow but alive" from a dead runtime.
+    Role-specific output/reasoning budgets prevent orchestration JSON from consuming
+    the same CPU budget as theorem construction. The Worker remains the high-reasoning
+    path; Director defaults to think=false on Qwen-family models.
     """
 
     def __init__(self, model: str, base_url: str | None = None):
@@ -53,6 +67,8 @@ class OllamaProvider(ModelProvider):
         self.health_failure_limit = _env_int('AWB_OLLAMA_HEALTH_FAILURES', 15, 1)
         self.progress_event_seconds = _env_float('AWB_OLLAMA_PROGRESS_EVENT_SECONDS', 60.0, 0.05)
         self.max_output_tokens = _env_int('AWB_OLLAMA_MAX_OUTPUT_TOKENS', 8192, 0)
+        self.think: bool | str | None = None
+        self.role: str | None = None
 
         # Compatibility only: old deployments may still define this variable. It no
         # longer imposes a generation deadline; stream read is deliberately unbounded.
@@ -64,6 +80,23 @@ class OllamaProvider(ModelProvider):
             write=self.health_timeout_seconds,
             pool=self.health_timeout_seconds,
         )
+
+    def configure_role(self, role: str) -> None:
+        """Apply a cheap orchestration budget without weakening Worker reasoning."""
+        self.role = role
+        default_tokens = _ROLE_TOKEN_DEFAULTS.get(role, self.max_output_tokens)
+        self.max_output_tokens = _env_int(
+            f'AWB_OLLAMA_{role.upper()}_MAX_OUTPUT_TOKENS', default_tokens, 0
+        )
+        explicit = _env_optional_bool(f'AWB_OLLAMA_{role.upper()}_THINK')
+        if explicit is not None:
+            self.think = explicit
+        elif role == 'director' and self.model.lower().startswith('qwen3'):
+            self.think = False
+        elif role == 'worker' and self.model.lower().startswith('qwen3'):
+            self.think = True
+        else:
+            self.think = None
 
     def _healthy(self) -> bool:
         try:
@@ -101,6 +134,8 @@ class OllamaProvider(ModelProvider):
         }
         if self.max_output_tokens > 0:
             payload['options'] = {'num_predict': self.max_output_tokens}
+        if self.think is not None:
+            payload['think'] = self.think
 
         def reader() -> None:
             try:
@@ -135,11 +170,13 @@ class OllamaProvider(ModelProvider):
             payload_event = {
                 'state': state,
                 'model': self.model,
+                'role': self.role,
                 'elapsed_seconds': round(now - started, 3),
                 'chunks': chunks_seen,
                 'output_chars': output_chars,
-                # Reasoning text is never exposed; only its size can establish liveness.
                 'thinking_chars': thinking_chars,
+                'max_output_tokens': self.max_output_tokens,
+                'thinking_enabled': self.think,
                 'last_stream_activity_seconds': round(now - last_stream_activity, 3),
                 'health_failures': health_failures,
                 **extra,
@@ -149,9 +186,11 @@ class OllamaProvider(ModelProvider):
             last_progress_event = now
 
         set_progress(self.model, {
-            'state': 'starting', 'model': self.model, 'elapsed_seconds': 0.0,
-            'chunks': 0, 'output_chars': 0, 'thinking_chars': 0,
-            'last_stream_activity_seconds': 0.0, 'health_failures': 0,
+            'state': 'starting', 'model': self.model, 'role': self.role,
+            'elapsed_seconds': 0.0, 'chunks': 0, 'output_chars': 0,
+            'thinking_chars': 0, 'max_output_tokens': self.max_output_tokens,
+            'thinking_enabled': self.think, 'last_stream_activity_seconds': 0.0,
+            'health_failures': 0,
         })
         try:
             while True:
@@ -164,11 +203,7 @@ class OllamaProvider(ModelProvider):
                         emit('alive', now, detail='No stream chunk recently, but Ollama health probes respond.')
                         continue
                     health_failures += 1
-                    emit(
-                        'health_check_failed',
-                        now,
-                        detail='No stream chunk and Ollama health probes failed.',
-                    )
+                    emit('health_check_failed', now, detail='No stream chunk and Ollama health probes failed.')
                     if health_failures >= self.health_failure_limit:
                         raise OllamaLivenessError(
                             'Ollama stopped streaming and failed '
@@ -198,7 +233,6 @@ class OllamaProvider(ModelProvider):
 
                 if now - last_progress_event >= self.progress_event_seconds or bool(item.get('done')):
                     emit('generating' if not item.get('done') else 'completed_stream', now)
-
                 if item.get('done'):
                     break
 
