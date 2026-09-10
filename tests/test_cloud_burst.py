@@ -18,9 +18,9 @@ from awb.providers.ollama_stream import OllamaProvider
 class CloudBurstTests(unittest.TestCase):
     def test_cost_meter_matches_published_sol_rate(self):
         with patch.dict(os.environ, {'AWB_USD_PER_EUR': '1.0'}):
-            usd, eur = cost_from_usage('gpt-5.6-sol', 1_000_000, 1_000_000)
-        self.assertAlmostEqual(usd, 24.0)
-        self.assertAlmostEqual(eur, 24.0)
+            usd, eur = cost_from_usage('gpt-5.6-sol', 100_000, 100_000)
+        self.assertAlmostEqual(usd, 2.4)
+        self.assertAlmostEqual(eur, 2.4)
 
     def test_long_context_sol_multiplier_is_counted(self):
         with patch.dict(os.environ, {'AWB_USD_PER_EUR': '1.0'}):
