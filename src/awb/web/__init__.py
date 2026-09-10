@@ -4,3 +4,10 @@ from awb.web import resource_monitor as _resource_monitor  # noqa: F401
 from awb.web import clarity_overlay as _clarity_overlay  # noqa: F401
 from awb.web import research_console as _research_console  # noqa: F401
 from awb.web import research_console_link as _research_console_link  # noqa: F401
+
+# Keep app.py backwards compatible while making every newly created/recovered
+# autonomous runner hot-reload the persisted cloud-burst policy at model-call
+# boundaries. Existing in-flight calls are deliberately untouched until restart.
+from awb.core.cloud_orchestrator import CloudAwareOrchestrator
+from awb.web import app as _app_module
+_app_module.Orchestrator = CloudAwareOrchestrator
