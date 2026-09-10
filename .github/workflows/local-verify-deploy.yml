@@ -24,7 +24,7 @@ jobs:
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'main')
     runs-on: [self-hosted, linux, expert-local]
-    timeout-minutes: 120
+    timeout-minutes: 350
 
     steps:
       - name: Choose trusted revision
@@ -150,9 +150,11 @@ jobs:
           done < "$CANDIDATES"
 
           echo "Requested safe pause for $(wc -l < "$PAUSED_FILE") active continuous job(s)."
+          echo "The current scientific task is allowed to finish; no model call is interrupted."
 
           ACTIVE=0
-          for _ in $(seq 1 900); do
+          SAFE_WAIT_DEADLINE=$((SECONDS + 18000))
+          while (( SECONDS < SAFE_WAIT_DEADLINE )); do
             ACTIVE="$(docker compose --env-file .env exec -T expert-my-rules python - <<'PY'
           import sqlite3
           from pathlib import Path
@@ -178,7 +180,7 @@ jobs:
           done
 
           if [ "$ACTIVE" != "0" ]; then
-            echo "Timed out waiting for a safe checkpoint; refusing to interrupt active research."
+            echo "Timed out after five hours waiting for a safe checkpoint; refusing to interrupt active research."
             exit 1
           fi
 
