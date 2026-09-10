@@ -20,16 +20,15 @@ from .orchestrator import Orchestrator
 class CloudAwareOrchestrator(Orchestrator):
     """Hot-switch important calls to a strictly metered OpenAI burst.
 
-    The control file is re-read at every model-call boundary. Enabling cloud while
-    Ollama is generating therefore never kills an in-flight local request: that
-    request finishes and is persisted normally, and the next eligible call can use
-    the cloud. When the internal meter cannot reserve the next call, routing falls
-    back to local inference rather than overspending deliberately.
+    Every model-call boundary re-reads both project and global monthly controls.
+    Once either ceiling cannot reserve the next call, routing fails closed to local
+    inference. An in-flight paid call is never duplicated or blindly retried.
     """
 
     def _cloud_important(self, role: str, task: Task | None) -> bool:
         control = load_control(self.workspace.root)
-        if not control.enabled or control.budget_eur <= 0:
+        snap = budget_snapshot(self.workspace.root)
+        if not control.enabled or control.budget_eur <= 0 or snap.get('hard_blocked'):
             return False
         if not os.getenv('OPENAI_API_KEY') or role not in control.roles or task is None:
             return False
@@ -50,17 +49,18 @@ class CloudAwareOrchestrator(Orchestrator):
         control = load_control(self.workspace.root)
         snap = budget_snapshot(self.workspace.root)
         remaining = float(snap['remaining_eur'])
-        config = role_cloud_config(role)
+        config = role_cloud_config(role, self.workspace.root)
 
-        # Prefer the role's intended model, then degrade gracefully when only a
-        # small tail of the burst remains. We never silently switch a Worker below
-        # Terra; a mathematical Worker falls back local rather than spending on a
-        # model chosen only because it is cheap.
         candidates = [config]
         if config['model'] == 'gpt-5.6-sol':
             candidates.append({**config, 'model': 'gpt-5.6-terra'})
         if role in {'director', 'verifier'}:
-            candidates.append({**config, 'model': 'gpt-5.6-luna', 'reasoning': 'low', 'max_output_tokens': min(1200, config['max_output_tokens'])})
+            candidates.append({
+                **config,
+                'model': 'gpt-5.6-luna',
+                'reasoning': 'low',
+                'max_output_tokens': min(1200, int(config['max_output_tokens'])),
+            })
 
         chosen = None
         reserve = None
@@ -74,6 +74,8 @@ class CloudAwareOrchestrator(Orchestrator):
                 'role': role,
                 'budget_eur': control.budget_eur,
                 'spent_eur': snap['spent_eur'],
+                'monthly_budget_eur': snap.get('monthly_budget_eur'),
+                'monthly_spent_eur': snap.get('monthly_spent_eur'),
                 'remaining_eur': remaining,
                 'action': 'fall_back_to_local',
             }, task.id)
@@ -89,6 +91,7 @@ class CloudAwareOrchestrator(Orchestrator):
             'task_id': task.id,
             'to': meta,
             'budget_eur': control.budget_eur,
+            'monthly_budget_eur': snap.get('monthly_budget_eur'),
             'remaining_before_eur': remaining,
             'reserved_eur': round(float(reserve), 6),
             'reasoning_effort': chosen['reasoning'],
@@ -103,8 +106,6 @@ class CloudAwareOrchestrator(Orchestrator):
             self._persist_model_call(meta, task.id, success=False, seconds=elapsed, error=error)
             self._attempt_routes.append({**meta, 'success': False, 'seconds': round(elapsed, 3), 'error': error})
             self.ledger.event('model_call_failed', {**meta, 'error': error, 'seconds': round(elapsed, 3)}, task.id)
-            # Cloud failure is not a reason to stop the autonomous run. The caller
-            # will retry the same call locally in this model-call boundary.
             self.ledger.event('cloud_call_fallback_local', {'role': role, 'error': error}, task.id)
             return None
 
@@ -113,10 +114,10 @@ class CloudAwareOrchestrator(Orchestrator):
         try:
             cost_usd, cost_eur = cost_from_usage(chosen['model'], input_tokens, output_tokens)
         except ValueError:
-            # Unknown pricing after a successful paid call is a metering fault: log
-            # it visibly and disable further burst use by exhausting the meter.
             cost_usd = 0.0
-            cost_eur = control.budget_eur
+            # Fail closed: consume the effective remaining amount so the following
+            # boundary cannot start another unmetered paid request.
+            cost_eur = remaining
         usage_event = {
             'role': role,
             'model': chosen['model'],
@@ -125,6 +126,7 @@ class CloudAwareOrchestrator(Orchestrator):
             'cost_usd': round(cost_usd, 6),
             'cost_eur': round(cost_eur, 6),
             'budget_eur': control.budget_eur,
+            'monthly_budget_eur': snap.get('monthly_budget_eur'),
             'response_id': provider.last_response_id,
         }
         self.ledger.event('cloud_usage_metered', usage_event, task.id)
@@ -179,7 +181,9 @@ class CloudAwareOrchestrator(Orchestrator):
                 self.ledger.event('model_call_failed', {**meta, 'error': error, 'seconds': round(elapsed, 3)}, task_id)
                 if index + 1 < len(calls):
                     self.ledger.event('model_route_failover', {
-                        'role': role, 'failed_node': meta['node'], 'next_node': calls[index + 1][2]['node']
+                        'role': role,
+                        'failed_node': meta['node'],
+                        'next_node': calls[index + 1][2]['node'],
                     }, task_id)
                     continue
                 raise

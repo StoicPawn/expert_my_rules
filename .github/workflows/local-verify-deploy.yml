@@ -11,8 +11,6 @@ permissions:
 
 concurrency:
   group: expert-my-rules-local-main
-  # A newer tested main may supersede an older waiter. EXIT cleanup resumes any
-  # job that the old waiter had paused; no workflow ever kills an active model call.
   cancel-in-progress: true
 
 jobs:
@@ -23,7 +21,7 @@ jobs:
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'main')
     runs-on: [self-hosted, linux, expert-local]
-    timeout-minutes: 900
+    timeout-minutes: 45
 
     steps:
       - name: Choose trusted revision
@@ -56,202 +54,191 @@ jobs:
           docker compose --env-file .env.example config >/dev/null
           bash -n ops/apply_acepc_resource_policy.sh
 
-      - name: Deploy observer, then hand off at safe checkpoint
+      - name: Deploy Control Center v2
         if: github.event_name == 'workflow_run'
         shell: bash
         env:
           DEPLOY_DIR: /home/stoicpawn/projects/expert_my_rules
-          SAFE_WAIT_SECONDS: "50400"
         run: |
           set -euo pipefail
           test -d "$DEPLOY_DIR/.git"
           test -f "$DEPLOY_DIR/.env"
 
-          CHANGED="$(git -C "$DEPLOY_DIR" diff --name-only)"
+          FORCE_CANCEL=0
+          if [ -f "$GITHUB_WORKSPACE/.force-cancel-active-research-once" ]; then
+            FORCE_CANCEL=1
+            echo "One-time forced research cancellation is authorized by this trusted revision."
+          fi
+
+          cd "$DEPLOY_DIR"
+          CHANGED="$(git diff --name-only)"
           if [ "$CHANGED" = "switch-inference.sh" ]; then
-            WORKTREE_BLOB="$(git hash-object "$DEPLOY_DIR/switch-inference.sh")"
-            INDEX_BLOB="$(git -C "$DEPLOY_DIR" rev-parse HEAD:switch-inference.sh)"
+            WORKTREE_BLOB="$(git hash-object switch-inference.sh)"
+            INDEX_BLOB="$(git rev-parse HEAD:switch-inference.sh)"
             if [ "$WORKTREE_BLOB" = "$INDEX_BLOB" ]; then
-              git -C "$DEPLOY_DIR" checkout -- switch-inference.sh
+              git checkout -- switch-inference.sh
             fi
           fi
-          if [ -n "$(git -C "$DEPLOY_DIR" status --porcelain --untracked-files=no)" ]; then
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
             echo "Production checkout has tracked local changes; refusing to overwrite them."
-            git -C "$DEPLOY_DIR" status --short
+            git status --short
             exit 1
           fi
 
-          git -C "$DEPLOY_DIR" fetch origin main
-          git -C "$DEPLOY_DIR" checkout main
-          git -C "$DEPLOY_DIR" reset --hard "${{ steps.rev.outputs.sha }}"
-          cd "$DEPLOY_DIR"
-          docker network inspect home-lab >/dev/null 2>&1 || docker network create home-lab
-
           MODE="$(awk -F= '$1=="AWB_INFERENCE_MODE" {print $2}' .env | tail -n1)"
           MODE="${MODE:-local}"
-          PORT="$(awk -F= '$1=="AWB_PORT" {print $2}' .env | tail -n1)"
-          PORT="${PORT:-8100}"
-          OBSERVER_PORT="$(awk -F= '$1=="AWB_OBSERVER_PORT" {print $2}' .env | tail -n1)"
-          OBSERVER_PORT="${OBSERVER_PORT:-8101}"
-          AWB_OLLAMA_CPU_FRACTION="$(awk -F= '$1=="AWB_OLLAMA_CPU_FRACTION" {print $2}' .env | tail -n1)"
-          AWB_OLLAMA_CPU_FRACTION="${AWB_OLLAMA_CPU_FRACTION:-0.85}"
-          AWB_SIDE_PROJECT_CPU_FRACTION="$(awk -F= '$1=="AWB_SIDE_PROJECT_CPU_FRACTION" {print $2}' .env | tail -n1)"
-          AWB_SIDE_PROJECT_CPU_FRACTION="${AWB_SIDE_PROJECT_CPU_FRACTION:-0.15}"
+          PORT="$(awk -F= '$1=="AWB_PORT" {print $2}' .env | tail -n1)"; PORT="${PORT:-8100}"
+          OBSERVER_PORT="$(awk -F= '$1=="AWB_OBSERVER_PORT" {print $2}' .env | tail -n1)"; OBSERVER_PORT="${OBSERVER_PORT:-8101}"
+          LAB_PORT="$(awk -F= '$1=="AWB_LAB_PORT" {print $2}' .env | tail -n1)"; LAB_PORT="${LAB_PORT:-8102}"
+
+          # Existing autonomous research is never killed by an ordinary deploy.
+          # This release contains a one-time marker because the user explicitly
+          # requested the current research to be terminated for the UI rebuild.
+          ACTIVE_JOBS=0
+          if docker compose --env-file .env ps -q expert-my-rules 2>/dev/null | grep -q .; then
+            ACTIVE_JOBS="$(docker compose --env-file .env exec -T expert-my-rules python - <<'PY'
+          import sqlite3
+          from pathlib import Path
+          total = 0
+          for db in Path('/data/workspaces').glob('*/ledger.sqlite3'):
+              conn = sqlite3.connect(db, timeout=15)
+              try:
+                  total += conn.execute("SELECT COUNT(*) FROM jobs WHERE continuous=1 AND status IN ('RUNNING','QUEUED','PAUSED','CANCEL_REQUESTED')").fetchone()[0]
+              finally:
+                  conn.close()
+          print(total)
+          PY
+            )"
+            ACTIVE_JOBS="$(printf '%s' "$ACTIVE_JOBS" | tr -d '[:space:]')"
+          fi
+
+          if [ "$ACTIVE_JOBS" != "0" ] && [ "$FORCE_CANCEL" != "1" ]; then
+            echo "Active autonomous research exists (${ACTIVE_JOBS} job(s)); safe deployment deferred. No process was interrupted."
+            exit 0
+          fi
+
+          if [ "$FORCE_CANCEL" = "1" ]; then
+            if docker compose --env-file .env ps -q expert-my-rules 2>/dev/null | grep -q .; then
+              docker compose --env-file .env exec -T expert-my-rules python - <<'PY'
+          import json, sqlite3
+          from datetime import datetime, timezone
+          from pathlib import Path
+          now = datetime.now(timezone.utc).isoformat()
+          cancelled = []
+          reopened = []
+          for db in Path('/data/workspaces').glob('*/ledger.sqlite3'):
+              conn = sqlite3.connect(db, timeout=30)
+              try:
+                  jobs = conn.execute("SELECT id FROM jobs WHERE continuous=1 AND status IN ('RUNNING','QUEUED','PAUSED','CANCEL_REQUESTED')").fetchall()
+                  for (jid,) in jobs:
+                      conn.execute("UPDATE jobs SET status='CANCELLED', detail=?, updated_at=? WHERE id=?", ('terminated by authorized Control Center v2 rebuild', now, jid))
+                      cancelled.append(f'{db.parent.name}:{jid}')
+                  tasks = conn.execute("SELECT id,metadata_json FROM tasks WHERE status='IN_PROGRESS'").fetchall()
+                  for task_id, metadata_json in tasks:
+                      try: metadata = json.loads(metadata_json or '{}')
+                      except Exception: metadata = {}
+                      metadata['interrupt_recoveries'] = int(metadata.get('interrupt_recoveries', 0)) + 1
+                      metadata['interrupted_by'] = 'authorized Control Center v2 rebuild'
+                      conn.execute("UPDATE tasks SET status='OPEN', metadata_json=?, updated_at=? WHERE id=?", (json.dumps(metadata), now, task_id))
+                      conn.execute("UPDATE attempts SET status='INTERRUPTED', error=CASE WHEN error='' THEN 'interrupted by authorized Control Center v2 rebuild' ELSE error END, finished_at=? WHERE task_id=? AND status='RUNNING'", (now, task_id))
+                      reopened.append(f'{db.parent.name}:{task_id}')
+                  conn.execute("INSERT INTO events(ts,kind,task_id,payload_json) VALUES(?,?,NULL,?)", (now, 'deployment_forced_cancel', json.dumps({'reason':'authorized Control Center v2 rebuild','cancelled_jobs':[x for x in cancelled if x.startswith(db.parent.name+':')],'reopened_tasks':[x for x in reopened if x.startswith(db.parent.name+':')]})))
+                  conn.commit()
+              finally:
+                  conn.close()
+          print('FORCED_CANCELLED_JOBS=' + json.dumps(cancelled))
+          print('REOPENED_INTERRUPTED_TASKS=' + json.dumps(reopened))
+          PY
+            fi
+            # Short timeout is intentional: the user explicitly authorized killing
+            # the in-flight research. Durable ledgers were repaired just above.
+            docker compose --env-file .env stop -t 2 expert-my-rules expert-observer 2>/dev/null || true
+            rm -f workspaces/.awb-runtime-progress.json
+          fi
+
+          git fetch origin main
+          git checkout main
+          git reset --hard "${{ steps.rev.outputs.sha }}"
+          docker network inspect home-lab >/dev/null 2>&1 || docker network create home-lab
+          mkdir -p lab-data
+
+          AWB_OLLAMA_CPU_FRACTION="$(awk -F= '$1=="AWB_OLLAMA_CPU_FRACTION" {print $2}' .env | tail -n1)"; AWB_OLLAMA_CPU_FRACTION="${AWB_OLLAMA_CPU_FRACTION:-0.85}"
+          AWB_SIDE_PROJECT_CPU_FRACTION="$(awk -F= '$1=="AWB_SIDE_PROJECT_CPU_FRACTION" {print $2}' .env | tail -n1)"; AWB_SIDE_PROJECT_CPU_FRACTION="${AWB_SIDE_PROJECT_CPU_FRACTION:-0.15}"
           export AWB_OLLAMA_CPU_FRACTION AWB_SIDE_PROJECT_CPU_FRACTION
           export AWB_BUILD_SHA="${{ steps.rev.outputs.sha }}"
-
           POLICY_OUTPUT="$(bash ops/apply_acepc_resource_policy.sh)"
           printf '%s\n' "$POLICY_OUTPUT"
           AWB_OLLAMA_CPUS="$(printf '%s\n' "$POLICY_OUTPUT" | awk -F= '$1=="AWB_OLLAMA_CPUS" {print $2}' | tail -n1)"
           test -n "$AWB_OLLAMA_CPUS"
           export AWB_OLLAMA_CPUS
-          echo "Ollama CPU envelope: ${AWB_OLLAMA_CPUS} logical CPUs ($(nproc) host CPUs, fraction ${AWB_OLLAMA_CPU_FRACTION})."
 
           if [ "$MODE" = "local" ]; then
             docker compose --env-file .env --profile local-inference build expert-my-rules
+            docker compose --env-file .env --profile local-inference up -d --no-build --force-recreate ollama expert-my-rules expert-observer expert-lab
           elif [ "$MODE" = "remote" ]; then
             docker compose --env-file .env build expert-my-rules
+            docker compose --env-file .env up -d --no-build --force-recreate expert-my-rules expert-observer expert-lab
           else
             echo "Unsupported AWB_INFERENCE_MODE=$MODE"
             exit 1
           fi
 
-          # Observer can be replaced immediately because it owns no autonomous
-          # execution thread. This makes Cloud Burst controls and spend telemetry
-          # available even while the current local inference is still finishing.
-          docker compose --env-file .env up -d --no-deps --force-recreate expert-observer
-          for _ in $(seq 1 60); do
-            if curl -fsS --max-time 3 "http://127.0.0.1:${OBSERVER_PORT}/health" >/dev/null; then
-              break
-            fi
-            sleep 2
-          done
-          curl -fsS --max-time 3 "http://127.0.0.1:${OBSERVER_PORT}/health" >/dev/null
-          echo "Research observer is live on port ${OBSERVER_PORT} at build ${AWB_BUILD_SHA}."
-
-          CANDIDATES="$RUNNER_TEMP/expert-safe-deploy-candidates.tsv"
-          PAUSED_FILE="$RUNNER_TEMP/expert-safe-deploy-paused.tsv"
-          : > "$CANDIDATES"
-          : > "$PAUSED_FILE"
-
-          resume_paused() {
-            [ -s "$PAUSED_FILE" ] || return 0
-            for _ in $(seq 1 60); do
-              if curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/" >/dev/null; then break; fi
-              sleep 2
-            done
-            while IFS=$'\t' read -r slug jid; do
-              [ -n "$slug" ] || continue
-              curl -fsS -X POST "http://127.0.0.1:${PORT}/project/${slug}/job/${jid}/resume" -o /dev/null || true
-              echo "Resumed ${jid} for ${slug}."
-            done < "$PAUSED_FILE"
-          }
-          trap 'resume_paused || true' EXIT
-
-          # Request pause now. The current Orchestrator only observes this between
-          # completed scientific steps, so the in-flight Ollama call is allowed to
-          # finish and its candidate/review state is persisted before handoff.
-          if docker compose --env-file .env ps -q expert-my-rules | grep -q .; then
-            docker compose --env-file .env exec -T expert-my-rules python - <<'PY' > "$CANDIDATES"
-          import sqlite3
+          # Migrate every existing project to expose LM Studio as a selectable
+          # compute node without changing its current primary model route.
+          docker compose --env-file .env exec -T expert-my-rules python - <<'PY'
           from pathlib import Path
-          for db in Path('/data/workspaces').glob('*/ledger.sqlite3'):
-              conn = sqlite3.connect(db, timeout=30)
-              try:
-                  for (job_id,) in conn.execute("SELECT id FROM jobs WHERE continuous=1 AND status='RUNNING'").fetchall():
-                      print(f"{db.parent.name}\t{job_id}")
-              finally:
-                  conn.close()
+          from awb.core.models import ComputeNodeSpec
+          from awb.core.workspace import load_workspace, save_manifest
+          for root in Path('/data/workspaces').iterdir():
+              if not (root / 'project.yaml').exists():
+                  continue
+              ws = load_workspace(root)
+              if not any(n.id == 'lm-studio' for n in ws.manifest.runtime.compute_nodes):
+                  ws.manifest.runtime.compute_nodes.append(ComputeNodeSpec(
+                      id='lm-studio', kind='lmstudio', base_url_env='LM_STUDIO_BASE_URL',
+                      enabled=True, max_concurrency=1, priority=90,
+                      tags=['local-or-lan', 'lm-studio'],
+                  ))
+                  save_manifest(ws)
+                  print(f'Added selectable LM Studio node to {root.name}')
           PY
-          fi
-          while IFS=$'\t' read -r slug jid; do
-            [ -n "$slug" ] || continue
-            curl -fsS -X POST "http://127.0.0.1:${PORT}/project/${slug}/job/${jid}/pause" -o /dev/null
-            printf '%s\t%s\n' "$slug" "$jid" >> "$PAUSED_FILE"
-          done < "$CANDIDATES"
-          echo "Safe pause requested for $(wc -l < "$PAUSED_FILE") continuous job(s); active calls are not interrupted."
 
-          ACTIVE=0
-          DEADLINE=$((SECONDS + SAFE_WAIT_SECONDS))
-          while (( SECONDS < DEADLINE )); do
-            ACTIVE=0
-            if docker compose --env-file .env ps -q expert-my-rules | grep -q .; then
-              ACTIVE="$(docker compose --env-file .env exec -T expert-my-rules python - <<'PY'
-          import sqlite3
-          from pathlib import Path
-          total=0
-          for db in Path('/data/workspaces').glob('*/ledger.sqlite3'):
-              conn=sqlite3.connect(db, timeout=30)
-              try: total += conn.execute("SELECT COUNT(*) FROM tasks WHERE status='IN_PROGRESS'").fetchone()[0]
-              finally: conn.close()
-          print(total)
-          PY
-              )"
-              ACTIVE="$(printf '%s' "$ACTIVE" | tr -d '[:space:]')"
-            fi
-            if [ "$ACTIVE" = "0" ]; then
-              echo "Safe checkpoint reached; no scientific task is IN_PROGRESS."
-              break
-            fi
-            sleep 10
-          done
-          if [ "$ACTIVE" != "0" ]; then
-            echo "Safe checkpoint not reached within ${SAFE_WAIT_SECONDS}s. Observer stays updated; refusing to interrupt ${ACTIVE} active task(s)."
-            resume_paused
-            : > "$PAUSED_FILE"
-            trap - EXIT
-            exit 0
-          fi
-
-          # Re-check after the pause has propagated to close the next-task race.
-          sleep 2
-          ACTIVE_AFTER_PAUSE="$(docker compose --env-file .env exec -T expert-my-rules python - <<'PY'
-          import sqlite3
-          from pathlib import Path
-          total=0
-          for db in Path('/data/workspaces').glob('*/ledger.sqlite3'):
-              conn=sqlite3.connect(db, timeout=30)
-              try: total += conn.execute("SELECT COUNT(*) FROM tasks WHERE status='IN_PROGRESS'").fetchone()[0]
-              finally: conn.close()
-          print(total)
-          PY
-          )"
-          ACTIVE_AFTER_PAUSE="$(printf '%s' "$ACTIVE_AFTER_PAUSE" | tr -d '[:space:]')"
-          if [ "$ACTIVE_AFTER_PAUSE" != "0" ]; then
-            echo "A task entered IN_PROGRESS during handoff; refusing restart."
-            resume_paused
-            : > "$PAUSED_FILE"
-            trap - EXIT
-            exit 0
-          fi
-
-          docker compose --env-file .env stop expert-my-rules
-          if [ "$MODE" = "local" ]; then
-            # Ollama must be recreated too so Docker applies the new 85% CPU quota.
-            docker compose --env-file .env --profile local-inference up -d --no-build --force-recreate ollama expert-my-rules expert-observer
-          else
-            docker compose --env-file .env up -d --no-build --force-recreate expert-my-rules expert-observer
-          fi
-
-          MAIN_OK=0
-          OBS_OK=0
+          MAIN_OK=0; OBS_OK=0; LAB_OK=0
           for _ in $(seq 1 90); do
-            curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/" >/dev/null && MAIN_OK=1 || true
+            curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/health" >/dev/null && MAIN_OK=1 || true
             curl -fsS --max-time 3 "http://127.0.0.1:${OBSERVER_PORT}/health" >/dev/null && OBS_OK=1 || true
-            if [ "$MAIN_OK" = "1" ] && [ "$OBS_OK" = "1" ]; then break; fi
+            curl -fsS --max-time 3 "http://127.0.0.1:${LAB_PORT}/health" >/dev/null && LAB_OK=1 || true
+            if [ "$MAIN_OK" = 1 ] && [ "$OBS_OK" = 1 ] && [ "$LAB_OK" = 1 ]; then break; fi
             sleep 2
           done
-          if [ "$MAIN_OK" != "1" ] || [ "$OBS_OK" != "1" ]; then
+          if [ "$MAIN_OK" != 1 ] || [ "$OBS_OK" != 1 ] || [ "$LAB_OK" != 1 ]; then
             docker compose --env-file .env ps || true
-            docker compose --env-file .env logs --tail=180 expert-my-rules expert-observer || true
+            docker compose --env-file .env logs --tail=200 expert-my-rules expert-observer expert-lab || true
             exit 1
+          fi
+
+          # After a forced rebuild, old autonomous jobs must stay cancelled. The new
+          # UI waits for the user to launch a new job explicitly.
+          if [ "$FORCE_CANCEL" = 1 ]; then
+            RUNNING_AFTER="$(docker compose --env-file .env exec -T expert-my-rules python - <<'PY'
+          import sqlite3
+          from pathlib import Path
+          total=0
+          for db in Path('/data/workspaces').glob('*/ledger.sqlite3'):
+              conn=sqlite3.connect(db, timeout=15)
+              try: total += conn.execute("SELECT COUNT(*) FROM jobs WHERE continuous=1 AND status IN ('RUNNING','QUEUED')").fetchone()[0]
+              finally: conn.close()
+          print(total)
+          PY
+            )"
+            test "$(printf '%s' "$RUNNING_AFTER" | tr -d '[:space:]')" = "0"
           fi
 
           if [ "$MODE" = "local" ]; then
             NANO_CPUS="$(docker inspect --format '{{.HostConfig.NanoCpus}}' "$(docker compose --env-file .env ps -q ollama)")"
             echo "Ollama Docker NanoCpus=${NANO_CPUS}; requested logical CPUs=${AWB_OLLAMA_CPUS}."
           fi
-          resume_paused
-          : > "$PAUSED_FILE"
-          trap - EXIT
-          echo "Expert My Rules optimized runtime + observer deployed, healthy and resumed safely."
+          echo "CONTROL_CENTER_URL=http://127.0.0.1:${PORT}"
+          echo "LIVE_DASHBOARD_URL=http://127.0.0.1:${OBSERVER_PORT}"
+          echo "RESEARCH_LAB_URL=http://127.0.0.1:${LAB_PORT}"
+          echo "Expert My Rules Control Center v2 deployed and healthy."
