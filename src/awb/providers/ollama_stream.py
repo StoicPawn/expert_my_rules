@@ -70,8 +70,6 @@ class OllamaProvider(ModelProvider):
         self.think: bool | str | None = None
         self.role: str | None = None
 
-        # Compatibility only: old deployments may still define this variable. It no
-        # longer imposes a generation deadline; stream read is deliberately unbounded.
         self.legacy_read_timeout_seconds = os.getenv('AWB_OLLAMA_READ_TIMEOUT_SECONDS')
         self.timeout = httpx.Timeout(connect=30.0, read=None, write=60.0, pool=60.0)
         self.health_timeout = httpx.Timeout(
@@ -140,10 +138,7 @@ class OllamaProvider(ModelProvider):
         def reader() -> None:
             try:
                 with httpx.stream(
-                    'POST',
-                    f'{self.base_url}/api/chat',
-                    json=payload,
-                    timeout=self.timeout,
+                    'POST', f'{self.base_url}/api/chat', json=payload, timeout=self.timeout,
                 ) as response:
                     response_holder['response'] = response
                     response.raise_for_status()
@@ -167,6 +162,9 @@ class OllamaProvider(ModelProvider):
 
         def emit(state: str, now: float, **extra: Any) -> None:
             nonlocal last_progress_event
+            # Only the model's public content stream is exposed. The separate
+            # reasoning/thinking field is deliberately represented by a char count.
+            visible_tail = ''.join(pieces)[-6000:]
             payload_event = {
                 'state': state,
                 'model': self.model,
@@ -175,6 +173,7 @@ class OllamaProvider(ModelProvider):
                 'chunks': chunks_seen,
                 'output_chars': output_chars,
                 'thinking_chars': thinking_chars,
+                'visible_tail': visible_tail,
                 'max_output_tokens': self.max_output_tokens,
                 'thinking_enabled': self.think,
                 'last_stream_activity_seconds': round(now - last_stream_activity, 3),
@@ -188,7 +187,7 @@ class OllamaProvider(ModelProvider):
         set_progress(self.model, {
             'state': 'starting', 'model': self.model, 'role': self.role,
             'elapsed_seconds': 0.0, 'chunks': 0, 'output_chars': 0,
-            'thinking_chars': 0, 'max_output_tokens': self.max_output_tokens,
+            'thinking_chars': 0, 'visible_tail': '', 'max_output_tokens': self.max_output_tokens,
             'thinking_enabled': self.think, 'last_stream_activity_seconds': 0.0,
             'health_failures': 0,
         })
