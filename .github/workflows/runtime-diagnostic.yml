@@ -25,12 +25,41 @@ jobs:
           echo '=== health ==='
           curl -i --max-time 5 http://127.0.0.1:8101/health || true
           echo '=== project state endpoints ==='
+          first_slug=''
           for d in workspaces/*; do
             [ -f "$d/project.yaml" ] || continue
             slug="$(basename "$d")"
+            [ -n "$first_slug" ] || first_slug="$slug"
             echo "--- $slug ---"
             curl -sS -i --max-time 15 "http://127.0.0.1:8101/project/${slug}/state" || true
             echo
           done
+          echo '=== rendered page javascript syntax ==='
+          if [ -n "$first_slug" ]; then
+            curl -fsS --max-time 15 "http://127.0.0.1:8101/project/${first_slug}" > /tmp/awb-dashboard.html || true
+            python3 - <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          class P(HTMLParser):
+              def __init__(self):
+                  super().__init__(); self.in_script=False; self.parts=[]
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower()=='script': self.in_script=True
+              def handle_endtag(self, tag):
+                  if tag.lower()=='script': self.in_script=False; self.parts.append('\n')
+              def handle_data(self, data):
+                  if self.in_script: self.parts.append(data)
+          p=P(); p.feed(Path('/tmp/awb-dashboard.html').read_text(encoding='utf-8',errors='replace'))
+          js=''.join(p.parts)
+          Path('/tmp/awb-dashboard.js').write_text(js,encoding='utf-8')
+          print(js[:12000])
+          PY
+            if command -v node >/dev/null 2>&1; then
+              echo '--- node --check ---'
+              node --check /tmp/awb-dashboard.js || true
+            else
+              echo 'node not installed on runner'
+            fi
+          fi
           echo '=== observer logs ==='
           docker compose --env-file .env logs --tail=250 expert-observer || true
