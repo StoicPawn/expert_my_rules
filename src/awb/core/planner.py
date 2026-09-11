@@ -46,7 +46,14 @@ def propose_manifest(goal: str, name: str | None = None, use_local_ai: bool = Tr
         os.getenv('AWB_WORKER_MODEL', os.getenv('AWB_LOCAL_MODEL', 'qwen3:4b')),
     )
     try:
-        raw = make_provider('ollama', model).generate(PLANNER_SYSTEM, goal)
+        provider = make_provider('ollama', model)
+        configure_role = getattr(provider, 'configure_role', None)
+        if callable(configure_role):
+            # Setup generation is orchestration JSON, not theorem construction.
+            # Give it its own small, non-thinking budget so a weak ACEPC model
+            # cannot spend tens of minutes producing thousands of unnecessary tokens.
+            configure_role('planner')
+        raw = provider.generate(PLANNER_SYSTEM, goal)
         data = json.loads(raw)
         if data.get('type') in {'research', 'software', 'custom'}:
             kind = data['type']
