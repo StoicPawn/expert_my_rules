@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import threading
 import time
@@ -12,7 +11,7 @@ from unittest.mock import patch
 
 from awb.core.acepc_policy import PRIMARY_MODEL, apply_acepc_policy
 from awb.core.checkpoints import build_project_state
-from awb.core.models import JobStatus, Task, TaskStatus
+from awb.core.models import Task, TaskStatus
 from awb.core.routing import ModelRouter
 from awb.core.storage import Ledger
 from awb.core.workspace import load_workspace, write_workspace
@@ -39,7 +38,7 @@ class LocalFirstEnduranceTests(unittest.TestCase):
             self.assertGreaterEqual(ws.manifest.runtime.max_tool_calls_per_task, 50)
             for role in ('director', 'worker', 'reviewer', 'verifier'):
                 self.assertEqual(ws.manifest.runtime.role_routes[role][0].model, PRIMARY_MODEL)
-            control = json.loads((root / 'cloud_burst.json').read_text())
+            control = json.loads((root / '.awb' / 'cloud_burst.json').read_text())
             self.assertFalse(control['enabled'])
             self.assertEqual(control['mode'], 'paused')
 
@@ -58,7 +57,7 @@ class LocalFirstEnduranceTests(unittest.TestCase):
                 try:
                     with router.slot(route):
                         entered.set()
-                except Exception as exc:  # pragma: no cover - assertion below
+                except Exception as exc:  # pragma: no cover
                     errors.append(exc)
                 finally:
                     released.set()
