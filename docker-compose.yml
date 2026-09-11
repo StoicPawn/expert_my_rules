@@ -23,7 +23,7 @@ services:
   expert-my-rules:
     build: .
     image: expert-my-rules-runtime:latest
-    command: ["uvicorn", "awb.web.control_app:control_app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "awb.web.control_v3:control_app", "--host", "0.0.0.0", "--port", "8000"]
     cpu_shares: 256
     ports:
       - "${AWB_PORT:-8100}:8000"
