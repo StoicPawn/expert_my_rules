@@ -19,3 +19,7 @@ from awb.web import app as _app_module
 # implementations.
 _cloud_module.CloudAwareOrchestrator = FocusedCloudAwareOrchestrator
 _app_module.Orchestrator = FocusedCloudAwareOrchestrator
+
+# Register durable project checkpoints, live outcome summaries and the
+# checkpoint-and-safe-pause controls after runtime_entry has installed its routes.
+from awb.web import checkpoint_runtime as _checkpoint_runtime  # noqa: F401,E402
