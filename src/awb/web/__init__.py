@@ -23,6 +23,9 @@ from awb.web import checkpoint_runtime as _checkpoint_runtime  # noqa: F401,E402
 # one project setup page. It is installed last so it replaces the historical
 # Control/Dashboard/Lab navigation without changing the durable runtime semantics.
 from awb.web import runtime_entry as _runtime_entry  # noqa: E402
+from awb.web import unified_control as _unified_control  # noqa: E402
 from awb.web.unified_control import install_unified_control  # noqa: E402
+from awb.web.unified_runtime_compat import install_runtime_compat  # noqa: E402
 
 install_unified_control(_runtime_entry.control_app, _runtime_entry)
+install_runtime_compat(_runtime_entry, _unified_control)
