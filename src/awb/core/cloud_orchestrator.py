@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 import time
 from contextlib import nullcontext
+from uuid import uuid4
 
 from awb.providers.providers import OpenAIProvider
 
 from .cloud_budget import (
     budget_snapshot,
+    cloud_budget_lock,
     cost_from_usage,
     load_control,
     reserve_cost_eur,
@@ -28,10 +30,12 @@ class CloudAwareOrchestrator(Orchestrator):
     def _cloud_important(self, role: str, task: Task | None) -> bool:
         control = load_control(self.workspace.root)
         snap = budget_snapshot(self.workspace.root)
-        if not control.enabled or control.budget_eur <= 0 or snap.get('hard_blocked'):
+        if not control.enabled or control.mode == 'paused' or control.budget_eur <= 0 or snap.get('hard_blocked'):
             return False
         if not os.getenv('OPENAI_API_KEY') or role not in control.roles or task is None:
             return False
+        if control.mode == 'force':
+            return True
         attempts = max(
             int(task.metadata.get('scientific_attempts', task.metadata.get('attempts', 0))),
             int(task.metadata.get('technical_failures', 0)),
@@ -46,11 +50,7 @@ class CloudAwareOrchestrator(Orchestrator):
         return input_tokens, output_tokens
 
     def _cloud_call(self, role: str, system: str, user: str, task: Task) -> str | None:
-        control = load_control(self.workspace.root)
-        snap = budget_snapshot(self.workspace.root)
-        remaining = float(snap['remaining_eur'])
         config = role_cloud_config(role, self.workspace.root)
-
         candidates = [config]
         if config['model'] == 'gpt-5.6-sol':
             candidates.append({**config, 'model': 'gpt-5.6-terra'})
@@ -64,23 +64,54 @@ class CloudAwareOrchestrator(Orchestrator):
 
         chosen = None
         reserve = None
-        for candidate in candidates:
-            needed = reserve_cost_eur(candidate['model'], system, user, int(candidate['max_output_tokens']))
-            if needed <= remaining:
-                chosen, reserve = candidate, needed
-                break
-        if chosen is None:
-            self.ledger.event('cloud_budget_exhausted', {
+        reservation_id = None
+        snap = None
+        control = None
+        # The reservation boundary is serialized across every project/process.
+        # Outstanding reservations are persisted before the request starts, so a
+        # crashed/killed paid call fails closed instead of silently freeing budget.
+        with cloud_budget_lock(self.workspace.root):
+            control = load_control(self.workspace.root)
+            snap = budget_snapshot(self.workspace.root)
+            if (
+                not control.enabled
+                or control.mode == 'paused'
+                or snap.get('hard_blocked')
+                or role not in control.roles
+                or not os.getenv('OPENAI_API_KEY')
+            ):
+                return None
+            remaining = float(snap['remaining_eur'])
+            for candidate in candidates:
+                needed = reserve_cost_eur(candidate['model'], system, user, int(candidate['max_output_tokens']))
+                if needed <= remaining:
+                    chosen, reserve = candidate, needed
+                    break
+            if chosen is None:
+                self.ledger.event('cloud_budget_exhausted', {
+                    'role': role,
+                    'mode': control.mode,
+                    'budget_eur': control.budget_eur,
+                    'spent_eur': snap['spent_eur'],
+                    'reserved_eur': snap.get('reserved_eur', 0.0),
+                    'monthly_budget_eur': snap.get('monthly_budget_eur'),
+                    'monthly_spent_eur': snap.get('monthly_spent_eur'),
+                    'monthly_reserved_eur': snap.get('monthly_reserved_eur', 0.0),
+                    'remaining_eur': remaining,
+                    'action': 'fall_back_to_local',
+                }, task.id)
+                return None
+            reservation_id = uuid4().hex
+            self.ledger.event('cloud_budget_reserved', {
+                'reservation_id': reservation_id,
+                'amount_eur': round(float(reserve), 6),
                 'role': role,
-                'budget_eur': control.budget_eur,
-                'spent_eur': snap['spent_eur'],
-                'monthly_budget_eur': snap.get('monthly_budget_eur'),
-                'monthly_spent_eur': snap.get('monthly_spent_eur'),
-                'remaining_eur': remaining,
-                'action': 'fall_back_to_local',
+                'model': chosen['model'],
+                'mode': control.mode,
             }, task.id)
-            return None
 
+        assert chosen is not None and reserve is not None and reservation_id is not None
+        remaining_before = float(snap['remaining_eur']) if snap else 0.0
         provider = OpenAIProvider(chosen['model'])
         provider.max_output_tokens = int(chosen['max_output_tokens'])
         provider.reasoning_effort = str(chosen['reasoning'])
@@ -90,10 +121,12 @@ class CloudAwareOrchestrator(Orchestrator):
             'role': role,
             'task_id': task.id,
             'to': meta,
-            'budget_eur': control.budget_eur,
-            'monthly_budget_eur': snap.get('monthly_budget_eur'),
-            'remaining_before_eur': remaining,
+            'mode': control.mode if control else 'auto',
+            'budget_eur': control.budget_eur if control else 0.0,
+            'monthly_budget_eur': snap.get('monthly_budget_eur') if snap else None,
+            'remaining_before_eur': remaining_before,
             'reserved_eur': round(float(reserve), 6),
+            'reservation_id': reservation_id,
             'reasoning_effort': chosen['reasoning'],
             'max_output_tokens': chosen['max_output_tokens'],
         }, task.id)
@@ -106,7 +139,15 @@ class CloudAwareOrchestrator(Orchestrator):
             self._persist_model_call(meta, task.id, success=False, seconds=elapsed, error=error)
             self._attempt_routes.append({**meta, 'success': False, 'seconds': round(elapsed, 3), 'error': error})
             self.ledger.event('model_call_failed', {**meta, 'error': error, 'seconds': round(elapsed, 3)}, task.id)
-            self.ledger.event('cloud_call_fallback_local', {'role': role, 'error': error}, task.id)
+            self.ledger.event('cloud_call_fallback_local', {
+                'role': role,
+                'error': error,
+                'reservation_id': reservation_id,
+                'reserved_eur': round(float(reserve), 6),
+                'reservation_held_fail_closed': True,
+            }, task.id)
+            # Deliberately do not release the reservation on an ambiguous paid-call
+            # failure: the provider may already have billed part/all of the request.
             return None
 
         elapsed = time.monotonic() - started
@@ -115,9 +156,9 @@ class CloudAwareOrchestrator(Orchestrator):
             cost_usd, cost_eur = cost_from_usage(chosen['model'], input_tokens, output_tokens)
         except ValueError:
             cost_usd = 0.0
-            # Fail closed: consume the effective remaining amount so the following
-            # boundary cannot start another unmetered paid request.
-            cost_eur = remaining
+            # Fail closed: charge the full reservation when pricing cannot be
+            # reconstructed instead of allowing another potentially over-budget call.
+            cost_eur = float(reserve)
         usage_event = {
             'role': role,
             'model': chosen['model'],
@@ -125,11 +166,21 @@ class CloudAwareOrchestrator(Orchestrator):
             'output_tokens': output_tokens,
             'cost_usd': round(cost_usd, 6),
             'cost_eur': round(cost_eur, 6),
-            'budget_eur': control.budget_eur,
-            'monthly_budget_eur': snap.get('monthly_budget_eur'),
+            'budget_eur': control.budget_eur if control else 0.0,
+            'monthly_budget_eur': snap.get('monthly_budget_eur') if snap else None,
             'response_id': provider.last_response_id,
+            'reservation_id': reservation_id,
         }
-        self.ledger.event('cloud_usage_metered', usage_event, task.id)
+        with cloud_budget_lock(self.workspace.root):
+            # Usage is written before the max reservation is released. There is no
+            # window in which another process can spend the same budget twice.
+            self.ledger.event('cloud_usage_metered', usage_event, task.id)
+            self.ledger.event('cloud_budget_released', {
+                'reservation_id': reservation_id,
+                'reserved_eur': round(float(reserve), 6),
+                'actual_eur': round(float(cost_eur), 6),
+                'reason': 'usage_recorded',
+            }, task.id)
         chars = len(result)
         self._persist_model_call(meta, task.id, success=True, seconds=elapsed, chars=chars)
         call_meta = {
