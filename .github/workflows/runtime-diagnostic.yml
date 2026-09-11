@@ -1,0 +1,36 @@
+name: runtime-diagnostic
+
+on:
+  push:
+    branches: ["diag/dashboard-runtime"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: [self-hosted, linux, expert-local]
+    timeout-minutes: 10
+    steps:
+      - name: Diagnose live dashboard
+        shell: bash
+        env:
+          DEPLOY_DIR: /home/stoicpawn/projects/expert_my_rules
+        run: |
+          set -u
+          cd "$DEPLOY_DIR"
+          echo '=== services ==='
+          docker compose --env-file .env ps || true
+          echo '=== health ==='
+          curl -i --max-time 5 http://127.0.0.1:8101/health || true
+          echo '=== project state endpoints ==='
+          for d in workspaces/*; do
+            [ -f "$d/project.yaml" ] || continue
+            slug="$(basename "$d")"
+            echo "--- $slug ---"
+            curl -sS -i --max-time 15 "http://127.0.0.1:8101/project/${slug}/state" || true
+            echo
+          done
+          echo '=== observer logs ==='
+          docker compose --env-file .env logs --tail=250 expert-observer || true
