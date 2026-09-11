@@ -6,8 +6,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from awb.core.checkpoints import build_project_state, latest_checkpoint, write_checkpoint
-from awb.core.cloud_budget import load_control
-from awb.core.focused_cloud_orchestrator import FocusedCloudAwareOrchestrator
+from awb.core.deep_engine import DeepIterativeEngine
 from awb.core.models import JobStatus
 from awb.core.resume_trace import capture_stream_trace
 from awb.core.storage import Ledger
@@ -15,16 +14,8 @@ from awb.web import runtime_entry
 from awb.web.control_v3 import _root, control_app
 
 
-class CheckpointedFocusedOrchestrator(FocusedCloudAwareOrchestrator):
-    """Focused reviewer loop + durable checkpoints + explicit-only paid API."""
-
-    def _cloud_important(self, role, task):
-        # AUTO is intentionally treated as local-only in endurance mode. Paid API
-        # calls are possible only after the user presses SBLOCCA API / FORCE.
-        control = load_control(self.workspace.root)
-        if control.mode != 'force':
-            return False
-        return super()._cloud_important(role, task)
+class CheckpointedDeepIterativeEngine(DeepIterativeEngine):
+    """Authoritative general-purpose engine plus durable checkpoint boundaries."""
 
     def step(self):
         try:
@@ -49,7 +40,9 @@ class CheckpointedFocusedOrchestrator(FocusedCloudAwareOrchestrator):
         return result
 
 
-runtime_entry.CloudAwareOrchestrator = CheckpointedFocusedOrchestrator
+# Compatibility alias retained for tests/importers from the previous checkpoint build.
+CheckpointedFocusedOrchestrator = CheckpointedDeepIterativeEngine
+runtime_entry.CloudAwareOrchestrator = CheckpointedDeepIterativeEngine
 
 
 _original_project_page = runtime_entry.project_page_runtime
@@ -95,7 +88,7 @@ def checkpoint_project_page(request: Request, project: str):
     <form method='post' action='/project/{project}/checkpoint'><button class='secondary'>SALVA CHECKPOINT ORA</button></form>
     <form method='post' action='/project/{project}/checkpoint-pause'><button>CHECKPOINT & PAUSA SICURA</button></form>
   </div>
-  <p class='small muted'>Il checkpoint salva risultati positivi e negativi, obiezioni, verifiche, artifact, strategia, focus chain e la generazione locale visibile in corso. Il reasoning nascosto non viene salvato.</p>
+  <p class='small muted'>Il checkpoint salva risultati positivi e negativi, obiezioni, verifiche, artifact, strategia, grafo/focus e la generazione locale visibile in corso. Il reasoning nascosto non viene salvato.</p>
 </div>
 """
     anchor = '<h2>Budget API di questo progetto</h2>'
