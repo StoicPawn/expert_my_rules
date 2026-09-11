@@ -78,7 +78,7 @@ class LocalFirstEnduranceTests(unittest.TestCase):
             orch = CheckpointedFocusedOrchestrator(ws)
             task = Task(id='T1', title='hard', description='hard', priority=100)
             base = SimpleNamespace(enabled=True, mode='auto')
-            with patch('awb.web.checkpoint_runtime.load_control', return_value=base):
+            with patch('awb.core.deep_engine.load_control', return_value=base):
                 self.assertFalse(orch._cloud_important('worker', task))
 
     def test_checkpoint_preserves_negative_and_interrupted_resume_knowledge(self):
