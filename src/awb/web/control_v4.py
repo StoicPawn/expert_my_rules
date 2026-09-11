@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import json
+
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 
 from awb.web.control_v3 import control_app, project_v3
 
 
-# Control Center v3 refreshed the whole project page every 2.5 seconds while the
-# automatic setup was RUNNING/QUEUED. On mobile this stole scroll/tab state and,
-# under local-inference load, could leave Safari on ERR_CONNECTION_CLOSED. V4
-# keeps the document stable and polls only the tiny setup-status JSON endpoint.
+# V4 keeps the project document stable. Setup state and ACEPC telemetry are
+# updated through the tiny setup-status endpoint, so mobile scroll/tab/form
+# state is never lost while a local model is working.
 def _remove_project_get() -> None:
     control_app.router.routes[:] = [
         route for route in control_app.router.routes
@@ -34,8 +35,49 @@ _POLL_SCRIPT = r"""
   let inFlight = false;
 
   function setupCard() {
-    const form = document.querySelector("form[action='/project/" + CSS.escape(project) + "/auto-setup']");
-    return form ? form.closest('.card') : null;
+    return document.querySelector('[data-setup-card]') ||
+      document.querySelector("form[action='/project/" + CSS.escape(project) + "/auto-setup']")?.closest('.card');
+  }
+
+  function fmtSeconds(value) {
+    const n = Math.max(0, Number(value) || 0);
+    if (n < 60) return Math.round(n) + ' s';
+    const m = Math.floor(n / 60), s = Math.round(n % 60);
+    if (m < 60) return m + 'm ' + s + 's';
+    const h = Math.floor(m / 60);
+    return h + 'h ' + (m % 60) + 'm';
+  }
+
+  function fmtBytes(value) {
+    const n = Number(value) || 0;
+    if (!n) return '—';
+    return (n / 1073741824).toFixed(1) + ' GB';
+  }
+
+  function monitorPanel(card) {
+    let panel = card.querySelector('[data-setup-monitor]');
+    if (panel) return panel;
+    panel = document.createElement('div');
+    panel.dataset.setupMonitor = '1';
+    panel.style.margin = '12px 0';
+    panel.innerHTML = `
+      <div class="kpis" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+        <div class="kpi"><span>Fase</span><b data-kpi="stage" style="font-size:14px">—</b></div>
+        <div class="kpi"><span>Tempo</span><b data-kpi="elapsed">—</b></div>
+        <div class="kpi"><span>CPU ACEPC</span><b data-kpi="cpu">—</b></div>
+        <div class="kpi"><span>RAM ACEPC</span><b data-kpi="ram" style="font-size:14px">—</b></div>
+        <div class="kpi"><span>Modello</span><b data-kpi="model" style="font-size:13px">—</b></div>
+        <div class="kpi"><span>Attività modello</span><b data-kpi="modelstate" style="font-size:13px">—</b></div>
+      </div>
+      <div class="small muted" data-kpi="work" style="margin-top:8px"></div>`;
+    const form = card.querySelector('form');
+    if (form) card.insertBefore(panel, form); else card.appendChild(panel);
+    return panel;
+  }
+
+  function setKpi(panel, key, value) {
+    const node = panel.querySelector('[data-kpi="' + key + '"]');
+    if (node) node.textContent = value;
   }
 
   function paint(data) {
@@ -52,8 +94,26 @@ _POLL_SCRIPT = r"""
       badge.classList.remove('ok', 'warn', 'bad');
       badge.classList.add(status === 'READY' ? 'ok' : status === 'ERROR' ? 'bad' : 'warn');
     }
-    const paragraphs = card.querySelectorAll('p');
-    if (paragraphs.length) paragraphs[paragraphs.length - 1].textContent = String(data.detail || '');
+    const detail = card.querySelector('[data-setup-detail]');
+    if (detail) detail.textContent = String(data.detail || '');
+
+    const panel = monitorPanel(card);
+    const r = data.resources || {};
+    const p = data.model_progress || {};
+    setKpi(panel, 'stage', String(data.stage || status));
+    setKpi(panel, 'elapsed', data.elapsed_seconds == null ? '—' : fmtSeconds(data.elapsed_seconds));
+    setKpi(panel, 'cpu', r.cpu_percent == null ? 'sampling…' : Math.round(Number(r.cpu_percent)) + '%');
+    const ram = r.ram_total ? fmtBytes(r.ram_used) + ' / ' + fmtBytes(r.ram_total) + (r.ram_percent == null ? '' : ' · ' + Math.round(Number(r.ram_percent)) + '%') : '—';
+    setKpi(panel, 'ram', ram);
+    setKpi(panel, 'model', String(p.model || r.model || '—'));
+    setKpi(panel, 'modelstate', String(p.state || data.liveness || '—'));
+    const stats = [];
+    if (p.chunks != null) stats.push(String(p.chunks) + ' chunk');
+    if (p.output_chars != null) stats.push(String(p.output_chars) + ' caratteri output');
+    if (p.last_stream_activity_seconds != null) stats.push('ultimo segnale ' + fmtSeconds(p.last_stream_activity_seconds) + ' fa');
+    if (data.liveness === 'ACTIVE' && Number(data.elapsed_seconds || 0) > 900) stats.push('lento, ma il modello risponde');
+    if (data.liveness === 'DEGRADED') stats.push('attenzione: health check del modello in errore');
+    setKpi(panel, 'work', stats.join(' · '));
 
     let action = card.querySelector('[data-setup-refresh]');
     if ((status === 'READY' || status === 'ERROR') && !action) {
@@ -65,9 +125,7 @@ _POLL_SCRIPT = r"""
       action.addEventListener('click', () => window.location.reload());
       card.appendChild(action);
     }
-    if (status === 'READY' || status === 'ERROR' || status === 'DEFERRED') {
-      stopped = true;
-    }
+    if (status === 'READY' || status === 'ERROR' || status === 'DEFERRED') stopped = true;
   }
 
   function showOffline() {
@@ -91,12 +149,12 @@ _POLL_SCRIPT = r"""
   async function poll() {
     if (stopped || inFlight) return;
     if (document.hidden) {
-      timer = window.setTimeout(poll, 10000);
+      timer = window.setTimeout(poll, 12000);
       return;
     }
     inFlight = true;
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 2500);
+    const timeout = window.setTimeout(() => controller.abort(), 3000);
     try {
       const response = await fetch(endpoint, {
         cache: 'no-store',
@@ -125,7 +183,7 @@ _POLL_SCRIPT = r"""
     }
   });
 
-  timer = window.setTimeout(poll, 800);
+  timer = window.setTimeout(poll, 500);
 })();
 </script>
 """
@@ -135,12 +193,7 @@ _POLL_SCRIPT = r"""
 def project_v4(request: Request, project: str):
     response = project_v3(request, project)
     html = response.body.decode('utf-8')
-
-    # V3 may have injected this exact full-page refresh when setup is active.
-    # Remove it unconditionally. The user must never lose scroll/tab/form state.
     html = html.replace('setTimeout(()=>location.reload(),2500);', '')
-
-    import json
     script = _POLL_SCRIPT.replace('__PROJECT_JSON__', json.dumps(project))
     html = html.replace('</body></html>', script + '</body></html>', 1)
     return HTMLResponse(html, headers={'Cache-Control': 'no-store'})
