@@ -82,9 +82,12 @@ class FocusedReviewLoopTests(unittest.TestCase):
 
             first = orch.step()
             self.assertEqual(first.task.id, 'ROOT')
-            self.assertEqual(first.task.status, TaskStatus.OPEN)
+            # The completed attempt remains BLOCKED in the attempt ledger, while
+            # next_task is already the same task reopened as focused REWORK.
+            self.assertEqual(first.task.status, TaskStatus.BLOCKED)
             self.assertEqual(first.task.metadata['lifecycle_phase'], 'REWORK')
             self.assertEqual(first.next_task.id, 'ROOT')
+            self.assertEqual(first.next_task.status, TaskStatus.OPEN)
 
             second = orch.step()
             self.assertEqual(second.task.id, 'ROOT')
