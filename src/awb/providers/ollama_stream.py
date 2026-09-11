@@ -10,6 +10,13 @@ from typing import Any
 import httpx
 
 from .base import ModelProvider
+from .runtime_cancel import (
+    ModelGenerationCancelled,
+    current_job_id,
+    event_for_current_job,
+    generation_finished,
+    generation_started,
+)
 from .runtime_progress import clear_progress, set_progress
 
 
@@ -55,9 +62,8 @@ class OllamaProvider(ModelProvider):
     a watchdog observes liveness independently from speed. A slow generation may run
     for hours as long as the stream makes progress or Ollama remains healthy.
 
-    Role-specific output/reasoning budgets prevent orchestration JSON from consuming
-    the same CPU budget as theorem construction. The Worker remains the high-reasoning
-    path; Planner and Director default to think=false on Qwen-family models.
+    A STOP request is checked at sub-second cadence. It closes the active HTTP stream,
+    aborts the generation and releases the scheduler slot before another run may start.
     """
 
     def __init__(self, model: str, base_url: str | None = None):
@@ -70,7 +76,6 @@ class OllamaProvider(ModelProvider):
         self.max_output_tokens = _env_int('AWB_OLLAMA_MAX_OUTPUT_TOKENS', 8192, 0)
         self.think: bool | str | None = None
         self.role: str | None = None
-
         self.legacy_read_timeout_seconds = os.getenv('AWB_OLLAMA_READ_TIMEOUT_SECONDS')
         self.timeout = httpx.Timeout(connect=30.0, read=None, write=60.0, pool=60.0)
         self.health_timeout = httpx.Timeout(
@@ -81,12 +86,9 @@ class OllamaProvider(ModelProvider):
         )
 
     def configure_role(self, role: str) -> None:
-        """Apply role-specific cost/reasoning limits without a wall-clock timeout."""
         self.role = role
         default_tokens = _ROLE_TOKEN_DEFAULTS.get(role, self.max_output_tokens)
-        self.max_output_tokens = _env_int(
-            f'AWB_OLLAMA_{role.upper()}_MAX_OUTPUT_TOKENS', default_tokens, 0
-        )
+        self.max_output_tokens = _env_int(f'AWB_OLLAMA_{role.upper()}_MAX_OUTPUT_TOKENS', default_tokens, 0)
         explicit = _env_optional_bool(f'AWB_OLLAMA_{role.upper()}_THINK')
         if explicit is not None:
             self.think = explicit
@@ -122,6 +124,11 @@ class OllamaProvider(ModelProvider):
         q: queue.Queue[Any] = queue.Queue()
         response_holder: dict[str, Any] = {}
         stop = threading.Event()
+        cancel_event = event_for_current_job()
+        job_id = current_job_id()
+        if cancel_event.is_set():
+            raise ModelGenerationCancelled(f'Generation cancelled before start for job {job_id}')
+        generation_started()
 
         payload: dict[str, Any] = {
             'model': self.model,
@@ -138,9 +145,7 @@ class OllamaProvider(ModelProvider):
 
         def reader() -> None:
             try:
-                with httpx.stream(
-                    'POST', f'{self.base_url}/api/chat', json=payload, timeout=self.timeout,
-                ) as response:
+                with httpx.stream('POST', f'{self.base_url}/api/chat', json=payload, timeout=self.timeout) as response:
                     response_holder['response'] = response
                     response.raise_for_status()
                     for line in response.iter_lines():
@@ -163,18 +168,16 @@ class OllamaProvider(ModelProvider):
 
         def emit(state: str, now: float, **extra: Any) -> None:
             nonlocal last_progress_event
-            # Only the model's public content stream is exposed. The separate
-            # reasoning/thinking field is deliberately represented by a char count.
-            visible_tail = ''.join(pieces)[-6000:]
             payload_event = {
                 'state': state,
                 'model': self.model,
                 'role': self.role,
+                'job_id': job_id,
                 'elapsed_seconds': round(now - started, 3),
                 'chunks': chunks_seen,
                 'output_chars': output_chars,
                 'thinking_chars': thinking_chars,
-                'visible_tail': visible_tail,
+                'visible_tail': ''.join(pieces)[-6000:],
                 'max_output_tokens': self.max_output_tokens,
                 'thinking_enabled': self.think,
                 'last_stream_activity_seconds': round(now - last_stream_activity, 3),
@@ -186,7 +189,7 @@ class OllamaProvider(ModelProvider):
             last_progress_event = now
 
         set_progress(self.model, {
-            'state': 'starting', 'model': self.model, 'role': self.role,
+            'state': 'starting', 'model': self.model, 'role': self.role, 'job_id': job_id,
             'elapsed_seconds': 0.0, 'chunks': 0, 'output_chars': 0,
             'thinking_chars': 0, 'visible_tail': '', 'max_output_tokens': self.max_output_tokens,
             'thinking_enabled': self.think, 'last_stream_activity_seconds': 0.0,
@@ -194,10 +197,15 @@ class OllamaProvider(ModelProvider):
         })
         try:
             while True:
+                if cancel_event.is_set():
+                    emit('cancelling', time.monotonic(), detail='STOP requested; closing Ollama stream.')
+                    raise ModelGenerationCancelled(f'Generation cancelled for job {job_id}')
                 try:
-                    item = q.get(timeout=self.stall_check_seconds)
+                    item = q.get(timeout=min(0.5, self.stall_check_seconds))
                 except queue.Empty:
                     now = time.monotonic()
+                    if now - last_stream_activity < self.stall_check_seconds:
+                        continue
                     if self._healthy():
                         health_failures = 0
                         emit('alive', now, detail='No stream chunk recently, but Ollama health probes respond.')
@@ -210,14 +218,15 @@ class OllamaProvider(ModelProvider):
                             f'{health_failures} consecutive health checks; generation is considered stalled.'
                         )
                     continue
-
+                if cancel_event.is_set():
+                    emit('cancelling', time.monotonic(), detail='STOP requested; closing Ollama stream.')
+                    raise ModelGenerationCancelled(f'Generation cancelled for job {job_id}')
                 if item is _END:
                     break
                 if isinstance(item, BaseException):
                     raise item
                 if not isinstance(item, dict):
                     continue
-
                 now = time.monotonic()
                 last_stream_activity = now
                 health_failures = 0
@@ -230,12 +239,10 @@ class OllamaProvider(ModelProvider):
                     output_chars += len(str(content))
                 if thinking:
                     thinking_chars += len(str(thinking))
-
                 if now - last_progress_event >= self.progress_event_seconds or bool(item.get('done')):
                     emit('generating' if not item.get('done') else 'completed_stream', now)
                 if item.get('done'):
                     break
-
             result = ''.join(pieces)
             if not result.strip():
                 raise RuntimeError('Ollama stream completed without a visible assistant response')
@@ -250,3 +257,4 @@ class OllamaProvider(ModelProvider):
                     pass
             thread.join(timeout=2.0)
             clear_progress(self.model)
+            generation_finished()
