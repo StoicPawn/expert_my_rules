@@ -66,10 +66,10 @@ class FocusedCloudAwareOrchestrator(CloudAwareOrchestrator):
         root_id = str(task.metadata.get('focus_chain_id') or task.id)
 
         if action == 'retry':
-            # A rejected candidate is not a parking state: immediately queue the
-            # same task as REWORK so the next worker call receives the objections
-            # and revised strategy before unrelated OPEN work can run.
-            task.status = TaskStatus.OPEN
+            # Keep this completed attempt durably BLOCKED until finish_attempt()
+            # records it as a scientific attempt. choose_next_task() immediately
+            # reopens the same focused task as REWORK before unrelated OPEN work.
+            task.status = TaskStatus.BLOCKED
             task.metadata['focus_chain_active'] = True
             task.metadata['focus_chain_id'] = root_id
             task.metadata['lifecycle_phase'] = 'REWORK'
@@ -99,7 +99,7 @@ class FocusedCloudAwareOrchestrator(CloudAwareOrchestrator):
         return plan
 
     def _adopt_legacy_recovery_state(self) -> None:
-        """Make old BLOCKED recovery records obey the focused lifecycle too."""
+        """Make old/current BLOCKED recovery records obey the focused lifecycle."""
         for parent in self.ledger.list_tasks([TaskStatus.BLOCKED]):
             waiting = list(parent.metadata.get('waiting_on_recovery_tasks') or [])
             root_id = str(parent.metadata.get('focus_chain_id') or parent.id)
@@ -121,13 +121,14 @@ class FocusedCloudAwareOrchestrator(CloudAwareOrchestrator):
                         self._mark_focus(child, phase, root_id=root_id)
                 continue
 
-            # Older versions left retryable scientific work in BLOCKED. If a
-            # concrete recovery strategy exists, turn it into focused REWORK now.
+            # A retryable reviewed task becomes REWORK immediately. This applies
+            # both to old persisted BLOCKED rows and to the attempt that just
+            # finished in the current process.
             if parent.metadata.get('next_strategy') or parent.metadata.get('last_recovery_action') == 'retry':
                 parent.status = TaskStatus.OPEN
                 self._mark_focus(parent, 'REWORK', root_id=root_id)
                 self.ledger.event(
-                    'legacy_blocked_adopted_as_rework',
+                    'blocked_task_reopened_as_focused_rework',
                     {'strategy': parent.metadata.get('next_strategy', '')},
                     parent.id,
                 )
