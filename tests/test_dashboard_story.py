@@ -6,11 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from awb.web.dashboard_runtime import dashboard_app
-from awb.web import dashboard_story
+from awb.web import dashboard_deep_live
 
 
 class DashboardStoryTests(unittest.TestCase):
-    def test_project_page_explains_agents_and_decisions(self):
+    def test_project_page_explains_agents_live_output_and_decisions(self):
         route = next(
             r for r in dashboard_app.router.routes
             if getattr(r, 'path', None) == '/project/{project}'
@@ -18,19 +18,21 @@ class DashboardStoryTests(unittest.TestCase):
         )
         request = SimpleNamespace(url=SimpleNamespace(hostname='testserver'))
         workspace = SimpleNamespace(manifest=SimpleNamespace(name='Demo', goal='Prove the result'))
-        with patch.object(dashboard_story, '_root', return_value=Path('/tmp/demo')), patch.object(
-            dashboard_story, 'load_workspace', return_value=workspace
+        with patch.object(dashboard_deep_live, '_root', return_value=Path('/tmp/demo')), patch.object(
+            dashboard_deep_live, 'load_workspace', return_value=workspace
         ):
             response = route.endpoint(request, 'demo')
         body = response.body.decode('utf-8')
-        self.assertIn('Agenti — chi fa cosa', body)
+        self.assertIn('Agenti — catena corrente', body)
         self.assertIn('Director', body)
         self.assertIn('Worker', body)
         self.assertIn('Reviewer', body)
         self.assertIn('Verifier', body)
-        self.assertIn('Task e prossima mossa', body)
-        self.assertIn('Timeline comprensibile', body)
-        self.assertIn("setInterval(tick,3000)", body)
+        self.assertIn('Produzione live del modello', body)
+        self.assertIn('Task corrente e obiezioni', body)
+        self.assertIn('Checkpoint / ripresa', body)
+        self.assertIn('Research Lab / strumenti', body)
+        self.assertIn("setInterval(tick,1000)", body)
         self.assertIn("task_recovery_planned", body)
         self.assertIn("work_output", body)
         self.assertIn("review", body)
