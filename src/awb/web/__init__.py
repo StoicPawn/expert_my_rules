@@ -18,3 +18,11 @@ _app_module.Orchestrator = DeepIterativeEngine
 # process-isolated routes. checkpoint_runtime replaces runtime_entry's local class
 # reference with CheckpointedDeepIterativeEngine without changing core modules.
 from awb.web import checkpoint_runtime as _checkpoint_runtime  # noqa: F401,E402
+
+# Final UI layer: exactly one project list/system page, one project dashboard and
+# one project setup page. It is installed last so it replaces the historical
+# Control/Dashboard/Lab navigation without changing the durable runtime semantics.
+from awb.web import runtime_entry as _runtime_entry  # noqa: E402
+from awb.web.unified_control import install_unified_control  # noqa: E402
+
+install_unified_control(_runtime_entry.control_app, _runtime_entry)
