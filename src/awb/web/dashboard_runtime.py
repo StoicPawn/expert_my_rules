@@ -78,6 +78,9 @@ def coherent_state(project: str):
                 'review_recommendations': list(meta.get('last_review_recommendations') or [])[:12],
                 'artifact': str(meta.get('artifact') or ''),
                 'interrupted_resume': dict(meta.get('interrupted_resume') or {}),
+                'depends_on': list(meta.get('depends_on') or []),
+                'verification_contract': dict(meta.get('verification_contract') or {}),
+                'strategy_fingerprints': list(meta.get('strategy_fingerprints') or [])[-8:],
             }
         compact.append(row)
     state['tasks'] = compact
@@ -96,6 +99,8 @@ def coherent_state(project: str):
         'busy_queue_unbounded': True,
         'api_manual_only': True,
         'slow_generation_is_failure': False,
+        'micro_task_verification_required': True,
+        'external_memory': True,
     }
     return JSONResponse(state, headers={'Cache-Control': 'no-store'})
 
@@ -103,6 +108,5 @@ def coherent_state(project: str):
 from awb.web.dashboard_story import install_agent_story_dashboard
 install_agent_story_dashboard(dashboard_app)
 
-# Final presentation layer: richer second-by-second output/tool/checkpoint view.
 from awb.web.dashboard_deep_live import install_deep_live_dashboard
 install_deep_live_dashboard(dashboard_app)
