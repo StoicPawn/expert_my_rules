@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from .base import ModelProvider
+from .runtime_cancel import ModelGenerationCancelled, current_job_id, event_for_current_job
 from .runtime_progress import clear_progress, set_progress
 
 
@@ -58,6 +59,10 @@ class OllamaProvider(ModelProvider):
     Role-specific output/reasoning budgets prevent orchestration JSON from consuming
     the same CPU budget as theorem construction. The Worker remains the high-reasoning
     path; Planner and Director default to think=false on Qwen-family models.
+
+    A running generation is bound to the owning autonomous job. A user STOP request
+    closes the streaming HTTP response immediately and raises ModelGenerationCancelled,
+    so the model slot is released instead of waiting for the generation to finish.
     """
 
     def __init__(self, model: str, base_url: str | None = None):
@@ -122,6 +127,8 @@ class OllamaProvider(ModelProvider):
         q: queue.Queue[Any] = queue.Queue()
         response_holder: dict[str, Any] = {}
         stop = threading.Event()
+        cancel_event = event_for_current_job()
+        job_id = current_job_id()
 
         payload: dict[str, Any] = {
             'model': self.model,
@@ -163,13 +170,12 @@ class OllamaProvider(ModelProvider):
 
         def emit(state: str, now: float, **extra: Any) -> None:
             nonlocal last_progress_event
-            # Only the model's public content stream is exposed. The separate
-            # reasoning/thinking field is deliberately represented by a char count.
             visible_tail = ''.join(pieces)[-6000:]
             payload_event = {
                 'state': state,
                 'model': self.model,
                 'role': self.role,
+                'job_id': job_id,
                 'elapsed_seconds': round(now - started, 3),
                 'chunks': chunks_seen,
                 'output_chars': output_chars,
@@ -186,7 +192,7 @@ class OllamaProvider(ModelProvider):
             last_progress_event = now
 
         set_progress(self.model, {
-            'state': 'starting', 'model': self.model, 'role': self.role,
+            'state': 'starting', 'model': self.model, 'role': self.role, 'job_id': job_id,
             'elapsed_seconds': 0.0, 'chunks': 0, 'output_chars': 0,
             'thinking_chars': 0, 'visible_tail': '', 'max_output_tokens': self.max_output_tokens,
             'thinking_enabled': self.think, 'last_stream_activity_seconds': 0.0,
@@ -194,10 +200,17 @@ class OllamaProvider(ModelProvider):
         })
         try:
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    emit('cancelling', time.monotonic(), detail='STOP requested; closing Ollama stream.')
+                    raise ModelGenerationCancelled(f'Generation cancelled for job {job_id}')
+
                 try:
-                    item = q.get(timeout=self.stall_check_seconds)
+                    # Cancellation must not wait for the slow-model liveness interval.
+                    item = q.get(timeout=min(0.5, self.stall_check_seconds))
                 except queue.Empty:
                     now = time.monotonic()
+                    if now - last_stream_activity < self.stall_check_seconds:
+                        continue
                     if self._healthy():
                         health_failures = 0
                         emit('alive', now, detail='No stream chunk recently, but Ollama health probes respond.')
@@ -211,6 +224,9 @@ class OllamaProvider(ModelProvider):
                         )
                     continue
 
+                if cancel_event is not None and cancel_event.is_set():
+                    emit('cancelling', time.monotonic(), detail='STOP requested; closing Ollama stream.')
+                    raise ModelGenerationCancelled(f'Generation cancelled for job {job_id}')
                 if item is _END:
                     break
                 if isinstance(item, BaseException):
