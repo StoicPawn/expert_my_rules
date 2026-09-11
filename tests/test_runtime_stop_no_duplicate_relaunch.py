@@ -6,11 +6,13 @@ import unittest
 from awb.web import runtime_entry
 
 
-class RelaunchDedupeContractTests(unittest.TestCase):
-    def test_relaunch_uses_one_stable_assessment_task(self):
+class RelaunchResumeContractTests(unittest.TestCase):
+    def test_relaunch_resumes_persisted_ledger_without_generic_reassessment(self):
         source = inspect.getsource(runtime_entry.launch_runtime)
-        self.assertIn("DELETE FROM tasks WHERE created_by='relaunch'", source)
-        self.assertIn("RELAUNCH-REASSESS", source)
+        self.assertIn('project_resumed_from_ledger', source)
+        self.assertIn('preserved_negative_results', source)
+        self.assertNotIn("RELAUNCH-REASSESS", source)
+        self.assertNotIn("set_gate", source)
 
 
 if __name__ == '__main__':
