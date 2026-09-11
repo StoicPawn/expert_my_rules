@@ -1,0 +1,101 @@
+name: post-rollout-verify-once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/post-rollout-verify-once.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: expert-post-rollout-verify
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: [self-hosted, linux, expert-local]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify deployed runtime without mutation
+        shell: bash
+        env:
+          DEPLOY_DIR: /home/stoicpawn/projects/expert_my_rules
+          EXPECTED_BUILD: 9801e0ddfc77f88404686c5cdeb1ee0d5edf6b79
+          PROJECT: kellerer-rank-planar-2026
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_DIR"
+          PORT="$(awk -F= '$1=="AWB_PORT" {print $2}' .env | tail -n1)"; PORT="${PORT:-8100}"
+          OBSERVER_PORT="$(awk -F= '$1=="AWB_OBSERVER_PORT" {print $2}' .env | tail -n1)"; OBSERVER_PORT="${OBSERVER_PORT:-8101}"
+          LAB_PORT="$(awk -F= '$1=="AWB_LAB_PORT" {print $2}' .env | tail -n1)"; LAB_PORT="${LAB_PORT:-8102}"
+
+          echo "PROD_HEAD=$(git rev-parse HEAD)"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_BUILD"
+          docker compose --env-file .env --profile local-inference ps
+          curl -fsS --max-time 5 "http://127.0.0.1:${PORT}/health"
+          curl -fsS --max-time 5 "http://127.0.0.1:${OBSERVER_PORT}/health"
+          curl -fsS --max-time 5 "http://127.0.0.1:${LAB_PORT}/health"
+
+          echo
+          echo "OBSERVER_STATE"
+          curl -fsS --max-time 10 "http://127.0.0.1:${OBSERVER_PORT}/project/${PROJECT}/state" | python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)
+          print(json.dumps({
+            "build_sha": d.get("build_sha"),
+            "overall_status": d.get("overall_status"),
+            "job": d.get("job"),
+            "current_task": d.get("current_task"),
+            "focused_task": d.get("focused_task"),
+            "runtime_progress": d.get("runtime_progress"),
+            "resources": d.get("resources"),
+            "budget": {
+              "mode": (d.get("budget") or {}).get("mode"),
+              "requested_enabled": (d.get("budget") or {}).get("requested_enabled"),
+              "api_key_configured": (d.get("budget") or {}).get("api_key_configured")
+            },
+            "local_endurance": d.get("local_endurance")
+          }, indent=2, ensure_ascii=False))'
+
+          echo "RUNTIME_POLICY"
+          docker compose --env-file .env exec -T expert-my-rules python - "$PROJECT" <<'PY'
+          import json,sys
+          from pathlib import Path
+          from awb.core.cloud_budget import load_control
+          from awb.core.workspace import load_workspace
+          project=sys.argv[1]
+          root=Path('/data/workspaces')/project
+          ws=load_workspace(root)
+          rt=ws.manifest.runtime
+          cloud=load_control(root)
+          print(json.dumps({
+            'cloud': {'enabled': cloud.enabled, 'mode': cloud.mode},
+            'max_minutes_per_run': rt.max_minutes_per_run,
+            'continuous_session_minutes': rt.continuous_session_minutes,
+            'technical_retry_limit': rt.technical_retry_limit,
+            'queue_timeout_seconds': rt.scheduler.queue_timeout_seconds,
+            'routes': {role:[{'node':r.node,'model':r.model,'enabled':r.enabled} for r in rt.role_routes.get(role,[])] for role in ('director','worker','reviewer','verifier')}
+          }, indent=2))
+          PY
+
+          echo "LATEST_LEDGER"
+          docker compose --env-file .env exec -T expert-my-rules python - "$PROJECT" <<'PY'
+          import json,sqlite3,sys
+          from pathlib import Path
+          project=sys.argv[1]
+          db=Path('/data/workspaces')/project/'ledger.sqlite3'
+          conn=sqlite3.connect(db); conn.row_factory=sqlite3.Row
+          try:
+              job=conn.execute("SELECT id,status,detail,created_at,updated_at FROM jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+              tasks=conn.execute("SELECT id,title,status,metadata_json FROM tasks WHERE status IN ('IN_PROGRESS','OPEN','BLOCKED','ERROR') ORDER BY priority DESC,created_at ASC LIMIT 8").fetchall()
+              print(json.dumps({'job':dict(job) if job else None,'tasks':[{'id':r['id'],'title':r['title'],'status':r['status'],'metadata':json.loads(r['metadata_json'] or '{}')} for r in tasks]}, indent=2, ensure_ascii=False))
+          finally: conn.close()
+          PY
+
+          CID="$(docker compose --env-file .env ps -q ollama)"
+          test -n "$CID"
+          echo "OLLAMA_NANO_CPUS=$(docker inspect --format '{{.HostConfig.NanoCpus}}' "$CID")"
+          echo "POST_ROLLOUT_VERIFY_OK=1"
