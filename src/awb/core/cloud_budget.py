@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,10 +22,13 @@ ROLE_DEFAULTS = {
     'verifier': {'model': 'gpt-5.6-terra', 'reasoning': 'medium', 'max_output_tokens': 1800},
 }
 
+CLOUD_MODES = ('auto', 'force', 'paused')
+
 
 @dataclass
 class CloudBurstControl:
     enabled: bool = False
+    mode: str = 'auto'
     budget_eur: float = 5.0
     priority_threshold: float = 1.0
     roles: tuple[str, ...] = ('director', 'worker', 'reviewer', 'verifier')
@@ -33,6 +37,9 @@ class CloudBurstControl:
     note: str = 'Cloud calls are metered and fall back to local inference when a project or monthly ceiling is exhausted.'
 
     def normalized(self) -> 'CloudBurstControl':
+        self.mode = str(self.mode or 'auto').lower()
+        if self.mode not in CLOUD_MODES:
+            self.mode = 'auto'
         self.budget_eur = max(0.0, float(self.budget_eur))
         self.priority_threshold = max(0.0, float(self.priority_threshold))
         self.roles = tuple(str(r) for r in self.roles if str(r))
@@ -75,6 +82,36 @@ def global_control_path(root: Path) -> Path:
     return _workspaces_root(root) / '.awb' / 'global_cloud.json'
 
 
+def _budget_lock_path(root: Path) -> Path:
+    return _workspaces_root(root) / '.awb' / 'cloud-budget-lock.sqlite3'
+
+
+@contextmanager
+def cloud_budget_lock(root: Path):
+    """Serialize budget reservations across projects/processes.
+
+    The lock is a tiny SQLite transaction so it is portable across the supported
+    runtimes and survives multiple worker processes. The paid API call itself is
+    not serialized: only the atomic check+reservation boundary is.
+    """
+    path = _budget_lock_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=30, isolation_level=None)
+    try:
+        conn.execute('PRAGMA busy_timeout=30000')
+        conn.execute('BEGIN IMMEDIATE')
+        yield
+        conn.execute('COMMIT')
+    except BaseException:
+        try:
+            conn.execute('ROLLBACK')
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
 def load_control(root: Path) -> CloudBurstControl:
     path = control_path(root)
     if not path.exists():
@@ -84,6 +121,7 @@ def load_control(root: Path) -> CloudBurstControl:
         roles = tuple(raw.get('roles') or ())
         return CloudBurstControl(
             enabled=bool(raw.get('enabled', False)),
+            mode=str(raw.get('mode') or 'auto'),
             budget_eur=float(raw.get('budget_eur', 5.0)),
             priority_threshold=float(raw.get('priority_threshold', 1.0)),
             roles=roles or CloudBurstControl().roles,
@@ -170,6 +208,8 @@ def cost_from_usage(model: str, input_tokens: int, output_tokens: int) -> tuple[
 
 
 def reserve_cost_eur(model: str, system: str, user: str, max_output_tokens: int) -> float:
+    # UTF-8 bytes intentionally overestimate ordinary token counts. Combined with
+    # max_output_tokens this reservation is fail-closed rather than optimistic.
     approx_input_tokens = max(1, len((system + '\n' + user).encode('utf-8')) + 64)
     try:
         _, eur = cost_from_usage(model, approx_input_tokens, max_output_tokens)
@@ -232,13 +272,47 @@ def cloud_spend(root: Path, started_at: str = '') -> dict:
     return totals
 
 
+def cloud_reservations(root: Path) -> dict:
+    """Return unresolved fail-closed API reservations for one project."""
+    db = root / 'ledger.sqlite3'
+    if not db.exists():
+        return {'count': 0, 'cost_eur': 0.0}
+    active: dict[str, float] = {}
+    conn = sqlite3.connect(str(db), timeout=5)
+    try:
+        rows = conn.execute(
+            "SELECT kind,payload_json FROM events WHERE kind IN ('cloud_budget_reserved','cloud_budget_released') ORDER BY rowid"
+        ).fetchall()
+        for kind, payload_json in rows:
+            try:
+                payload = json.loads(payload_json or '{}')
+            except Exception:
+                continue
+            rid = str(payload.get('reservation_id') or '')
+            if not rid:
+                continue
+            if kind == 'cloud_budget_reserved':
+                active[rid] = max(0.0, float(payload.get('amount_eur') or 0.0))
+            else:
+                active.pop(rid, None)
+    except sqlite3.DatabaseError:
+        pass
+    finally:
+        conn.close()
+    return {'count': len(active), 'cost_eur': round(sum(active.values()), 6)}
+
+
 def _month_start() -> str:
     now = datetime.now(timezone.utc)
     return datetime(now.year, now.month, 1, tzinfo=timezone.utc).isoformat()
 
 
 def global_month_spend(root: Path) -> dict:
-    total = {'calls': 0, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': 0.0, 'cost_eur': 0.0}
+    total = {
+        'calls': 0, 'input_tokens': 0, 'output_tokens': 0,
+        'cost_usd': 0.0, 'cost_eur': 0.0, 'reserved_eur': 0.0,
+        'reservations': 0,
+    }
     workspace_root = _workspaces_root(root)
     since = _month_start()
     candidates = [root]
@@ -254,32 +328,47 @@ def global_month_spend(root: Path) -> dict:
         except OSError:
             continue
         snap = cloud_spend(candidate, since)
+        reservations = cloud_reservations(candidate)
         for key in ('calls', 'input_tokens', 'output_tokens'):
             total[key] += int(snap[key])
         for key in ('cost_usd', 'cost_eur'):
             total[key] += float(snap[key])
+        total['reserved_eur'] += float(reservations['cost_eur'])
+        total['reservations'] += int(reservations['count'])
     total['cost_usd'] = round(total['cost_usd'], 6)
     total['cost_eur'] = round(total['cost_eur'], 6)
+    total['reserved_eur'] = round(total['reserved_eur'], 6)
     return total
 
 
 def budget_snapshot(root: Path) -> dict:
     control = load_control(root)
     spend = cloud_spend(root, control.started_at)
-    project_remaining = max(0.0, control.budget_eur - float(spend['cost_eur']))
+    reservations = cloud_reservations(root)
+    project_remaining = max(
+        0.0,
+        control.budget_eur - float(spend['cost_eur']) - float(reservations['cost_eur']),
+    )
     global_control = load_global_control(root)
     month = global_month_spend(root)
     if global_control.enabled:
-        monthly_remaining = max(0.0, global_control.monthly_budget_eur - float(month['cost_eur']))
+        monthly_remaining = max(
+            0.0,
+            global_control.monthly_budget_eur
+            - float(month['cost_eur'])
+            - float(month['reserved_eur']),
+        )
     else:
         monthly_remaining = float('inf')
     effective_remaining = min(project_remaining, monthly_remaining)
     hard_blocked = bool(global_control.enabled and global_control.hard_stop and monthly_remaining <= 0)
     return {
-        'enabled': control.enabled and not hard_blocked,
+        'enabled': control.enabled and control.mode != 'paused' and not hard_blocked,
         'requested_enabled': control.enabled,
+        'mode': control.mode,
         'budget_eur': control.budget_eur,
         'spent_eur': spend['cost_eur'],
+        'reserved_eur': reservations['cost_eur'],
         'project_remaining_eur': round(project_remaining, 6),
         'remaining_eur': round(max(0.0, effective_remaining), 6),
         'calls': spend['calls'],
@@ -292,6 +381,7 @@ def budget_snapshot(root: Path) -> dict:
         'role_models': {role: role_cloud_config(role, root) for role in control.roles},
         'monthly_budget_eur': global_control.monthly_budget_eur,
         'monthly_spent_eur': month['cost_eur'],
+        'monthly_reserved_eur': month['reserved_eur'],
         'monthly_remaining_eur': None if monthly_remaining == float('inf') else round(monthly_remaining, 6),
         'monthly_calls': month['calls'],
         'hard_stop': global_control.hard_stop,

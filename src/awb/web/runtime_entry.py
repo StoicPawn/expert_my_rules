@@ -10,6 +10,7 @@ import httpx
 from fastapi import Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from awb.core.cloud_budget import budget_snapshot, load_control, save_control
 from awb.core.models import JobStatus, Task, TaskStatus
 from awb.core.orchestrator import Orchestrator
 from awb.core.routing import RouteBusyError
@@ -228,7 +229,53 @@ def project_page_runtime(request: Request, project: str):
             f'Configurazione pronta. Ultimo run FERMO per errore tecnico: {detail}',
             1,
         )
+
+    cloud = load_control(root)
+    snap = budget_snapshot(root)
+    mode_label = {
+        'auto': 'AUTO',
+        'force': 'API FORZATA',
+        'paused': 'API IN PAUSA',
+    }.get(cloud.mode, cloud.mode.upper())
+    if not cloud.enabled:
+        mode_label = 'API DISABILITATA'
+    key_label = 'chiave pronta' if snap.get('api_key_configured') else 'chiave NON configurata'
+    reserve_note = ''
+    reserved = float(snap.get('reserved_eur') or 0.0)
+    monthly_reserved = float(snap.get('monthly_reserved_eur') or 0.0)
+    if reserved or monthly_reserved:
+        reserve_note = f" · riservato €{reserved:.4f} progetto / €{monthly_reserved:.4f} mese"
+    quick = f"""
+<div class='task' style='margin-bottom:14px'>
+  <div class='split'><div><b>Modalità API adesso</b><div class='small muted'>{mode_label} · {key_label}{reserve_note}</div></div></div>
+  <div class='row' style='margin-top:10px'>
+    <form method='post' action='/project/{project}/cloud-mode'><input type='hidden' name='mode' value='auto'><button class='secondary'>AUTO</button></form>
+    <form method='post' action='/project/{project}/cloud-mode'><input type='hidden' name='mode' value='force'><button>FORZA API</button></form>
+    <form method='post' action='/project/{project}/cloud-mode'><input type='hidden' name='mode' value='paused'><button class='secondary'>PAUSA API</button></form>
+  </div>
+  <p class='small muted'>FORZA API manda le prossime chiamate eleggibili dei task su OpenAI; PAUSA API blocca nuove chiamate esterne e usa i modelli locali. Una chiamata già in volo non viene duplicata né interrotta. Il tetto progetto e il tetto mensile restano sempre vincolanti.</p>
+</div>
+"""
+    html = html.replace('<h2>Budget API di questo progetto</h2>', '<h2>Budget API di questo progetto</h2>' + quick, 1)
     return HTMLResponse(html, headers={'Cache-Control': 'no-store'})
+
+
+@control_app.post('/project/{project}/cloud-mode')
+def cloud_mode_runtime(project: str, mode: str = Form(...)):
+    if mode not in {'auto', 'force', 'paused'}:
+        raise HTTPException(400, 'Modalità API non valida')
+    root = _root(project)
+    control = load_control(root)
+    control.mode = mode
+    if mode in {'auto', 'force'}:
+        control.enabled = True
+    save_control(root, control)
+    Ledger(root / 'ledger.sqlite3').event('cloud_mode_changed', {
+        'mode': mode,
+        'enabled': control.enabled,
+        'source': 'user-ui',
+    })
+    return RedirectResponse(f'/project/{project}?tab=api', 303)
 
 
 @control_app.post('/project/{project}/launch')
