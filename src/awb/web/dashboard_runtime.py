@@ -75,3 +75,10 @@ def coherent_state(project: str):
     state['done_tasks'] = sum(1 for task in compact if task.get('status') == 'DONE')
 
     return JSONResponse(state, headers={'Cache-Control': 'no-store'})
+
+
+# Presentation-only overlay. It replaces the observer project page while keeping
+# the state endpoint above stable for tests and external consumers.
+from awb.web.dashboard_story import install_agent_story_dashboard
+
+install_agent_story_dashboard(dashboard_app)
