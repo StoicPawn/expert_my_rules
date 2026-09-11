@@ -11,8 +11,8 @@ from fastapi import Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from awb.core.cloud_budget import budget_snapshot, load_control, save_control
+from awb.core.cloud_orchestrator import CloudAwareOrchestrator
 from awb.core.models import JobStatus, Task, TaskStatus
-from awb.core.orchestrator import Orchestrator
 from awb.core.routing import RouteBusyError
 from awb.core.storage import Ledger
 from awb.core.workspace import load_workspace
@@ -50,7 +50,10 @@ def _clear_runtime_progress() -> None:
 def _run_continuous(root: Path, job_id: str) -> None:
     ws = load_workspace(root)
     ledger = Ledger(root / 'ledger.sqlite3')
-    orch = Orchestrator(ws)
+    # CloudAwareOrchestrator is the single runtime engine: API mode is evaluated
+    # at every model-call boundary, so FORZA API can start/continue on OpenAI and
+    # PAUSA API switches the same running job back to local LLM routes.
+    orch = CloudAwareOrchestrator(ws)
     ledger.update_job(job_id, status=JobStatus.RUNNING, detail='autonomous project active')
     try:
         while True:
@@ -253,7 +256,7 @@ def project_page_runtime(request: Request, project: str):
     <form method='post' action='/project/{project}/cloud-mode'><input type='hidden' name='mode' value='force'><button>FORZA API</button></form>
     <form method='post' action='/project/{project}/cloud-mode'><input type='hidden' name='mode' value='paused'><button class='secondary'>PAUSA API</button></form>
   </div>
-  <p class='small muted'>FORZA API manda le prossime chiamate eleggibili dei task su OpenAI; PAUSA API blocca nuove chiamate esterne e usa i modelli locali. Una chiamata già in volo non viene duplicata né interrotta. Il tetto progetto e il tetto mensile restano sempre vincolanti.</p>
+  <p class='small muted'>FORZA API manda tutte le prossime chiamate eleggibili su OpenAI; PAUSA API blocca nuove chiamate esterne e continua lo stesso job con i modelli locali. La modalità viene riletta a ogni chiamata, quindi non serve riavviare il progetto.</p>
 </div>
 """
     html = html.replace('<h2>Budget API di questo progetto</h2>', '<h2>Budget API di questo progetto</h2>' + quick, 1)
