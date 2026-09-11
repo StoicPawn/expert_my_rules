@@ -1,0 +1,45 @@
+name: hotdeploy-dashboard
+
+on:
+  push:
+    branches: ["ops/hotdeploy-dashboard"]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-observer-only:
+    runs-on: [self-hosted, linux, expert-local]
+    timeout-minutes: 15
+    steps:
+      - name: Deploy observer only
+        shell: bash
+        env:
+          DEPLOY_DIR: /home/stoicpawn/projects/expert_my_rules
+          TARGET_SHA: cc1c2aa3dbc098488c8f958bab944275cfe2071d
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_DIR"
+          test -d .git
+          test -f .env
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            echo 'Tracked local changes present; refusing observer hot-deploy.'
+            git status --short
+            exit 1
+          fi
+          git fetch origin main
+          git checkout main
+          git reset --hard "$TARGET_SHA"
+          export AWB_BUILD_SHA="$TARGET_SHA"
+          docker compose --env-file .env build expert-my-rules
+          docker compose --env-file .env up -d --no-build --force-recreate expert-observer
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 3 http://127.0.0.1:8101/health >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS --max-time 3 http://127.0.0.1:8101/health
+          PAGE="$(curl -fsS --max-time 10 http://127.0.0.1:8101/project/kellerer-rank-planar-2026)"
+          printf '%s' "$PAGE" | grep -F 'String.fromCharCode(10)' >/dev/null
+          STATE="$(curl -fsS --max-time 15 http://127.0.0.1:8101/project/kellerer-rank-planar-2026/state)"
+          printf '%s' "$STATE" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d.get('project')=='kellerer-rank-planar-2026'; print('job_status='+str((d.get('job') or {}).get('status'))); print('build_sha='+str(d.get('build_sha')))"
+          echo 'Observer-only dashboard hot-deploy completed; research containers were not recreated.'
