@@ -18,8 +18,22 @@ def badge(text: object, kind: str = '') -> str:
     return f"<span class='badge {html.escape(kind)}'>{esc(text)}</span>"
 
 
-def shell(title: str, body: str, *, active: str = 'setup', extra_head: str = '', extra_script: str = '') -> str:
+def shell(
+    title: str,
+    body: str,
+    *,
+    active: str = 'setup',
+    extra_head: str = '',
+    extra_script: str = '',
+    script: str = '',
+) -> str:
+    """Render the common shell.
+
+    ``script`` is a readable alias for ``extra_script`` used by richer live pages;
+    both are concatenated for backwards compatibility.
+    """
     del active  # navigation links are supplied by each app because they live on separate ports.
+    page_script = f'{extra_script}\n{script}'
     return f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)}</title><style>{BASE_CSS}</style>{extra_head}</head><body><div class='shell'><div class='brand' style='margin-bottom:12px'>Expert My Rules</div>{body}</div><script>
 (function(){{
   document.querySelectorAll('[data-tab]').forEach(function(btn){{
@@ -30,5 +44,5 @@ def shell(title: str, body: str, *, active: str = 'setup', extra_head: str = '',
     }});
   }});
 }})();
-{extra_script}
+{page_script}
 </script></body></html>"""
