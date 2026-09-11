@@ -11,6 +11,7 @@ from awb.core.workspace import load_workspace, save_manifest
 
 ROLES = ('director', 'worker', 'reviewer', 'verifier')
 PRIMARY_MODEL = os.getenv('AWB_LOCAL_MODEL', 'qwen3:4b')
+EFFECTIVELY_UNBOUNDED_TOOL_TIMEOUT = 2_147_483_647
 
 
 def apply_acepc_policy(root: Path, *, lock_cloud: bool = False) -> dict:
@@ -56,14 +57,12 @@ def apply_acepc_policy(root: Path, *, lock_cloud: bool = False) -> dict:
         if agent is not None:
             agent.provider = ProviderSpec(kind='ollama', model=PRIMARY_MODEL)
 
-    # Zero queue timeout means wait for the single local inference slot forever.
     runtime.scheduler.enabled = True
     runtime.scheduler.queue_timeout_seconds = 0.0
     runtime.scheduler.failure_threshold = max(5, int(runtime.scheduler.failure_threshold))
     runtime.scheduler.cooldown_seconds = min(30.0, max(1.0, float(runtime.scheduler.cooldown_seconds)))
     runtime.scheduler.allow_cooldown_probe = True
 
-    # No time deadline: the ACEPC may take hours/days on one scientific task.
     runtime.max_minutes_per_run = 0
     runtime.continuous_session_minutes = 0
     runtime.technical_retry_limit = 0
@@ -72,15 +71,15 @@ def apply_acepc_policy(root: Path, *, lock_cloud: bool = False) -> dict:
     runtime.recovery_history_limit = max(20, int(runtime.recovery_history_limit))
     runtime.checkpoint_pause_seconds = max(0.5, float(runtime.checkpoint_pause_seconds))
 
-    # The older escalation path must never call a paid provider automatically.
     runtime.escalation.enabled = False
     runtime.escalation.daily_budget_eur = 0.0
     runtime.escalation.max_cloud_calls_per_run = 0
 
     for tool in ws.manifest.tools:
         if tool.id == 'lab_execute':
-            # 0 is interpreted by ToolRunner as no wall-clock timeout.
-            tool.timeout_seconds = 0
+            # ToolRunner currently expects a positive subprocess timeout. This is
+            # ~68 years, i.e. operationally unbounded while remaining compatible.
+            tool.timeout_seconds = EFFECTIVELY_UNBOUNDED_TOOL_TIMEOUT
 
     save_manifest(ws)
 
