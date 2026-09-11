@@ -153,7 +153,13 @@ jobs:
             # Short timeout is intentional: the user explicitly authorized killing
             # the in-flight research. Durable ledgers were repaired just above.
             docker compose --env-file .env stop -t 2 expert-my-rules expert-observer 2>/dev/null || true
-            rm -f workspaces/.awb-runtime-progress.json
+            # The shared progress file is normally root-owned because it is written
+            # from inside the container. Remove it through a one-shot container
+            # instead of trying to unlink it as the host runner user.
+            docker compose --env-file .env run --rm --no-deps expert-my-rules python - <<'PY'
+          from pathlib import Path
+          Path('/data/workspaces/.awb-runtime-progress.json').unlink(missing_ok=True)
+          PY
           fi
 
           git fetch origin main
