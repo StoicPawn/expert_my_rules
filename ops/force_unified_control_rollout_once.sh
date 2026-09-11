@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEPLOY_DIR="${DEPLOY_DIR:-/home/stoicpawn/projects/expert_my_rules}"
+TARGET_SHA="${TARGET_SHA:-${GITHUB_SHA:-}}"
+test -n "$TARGET_SHA"
+test -d "$DEPLOY_DIR/.git"
+test -f "$DEPLOY_DIR/.env"
+
+PORT="$(awk -F= '$1=="AWB_PORT" {print $2}' "$DEPLOY_DIR/.env" | tail -n1)"; PORT="${PORT:-8100}"
+OBSERVER_PORT="$(awk -F= '$1=="AWB_OBSERVER_PORT" {print $2}' "$DEPLOY_DIR/.env" | tail -n1)"; OBSERVER_PORT="${OBSERVER_PORT:-8101}"
+LAB_PORT="$(awk -F= '$1=="AWB_LAB_PORT" {print $2}' "$DEPLOY_DIR/.env" | tail -n1)"; LAB_PORT="${LAB_PORT:-8102}"
+RESUME_FILE="/tmp/expert-unified-resume-${GITHUB_RUN_ID:-manual}.txt"
+: > "$RESUME_FILE"
+
+cd "$DEPLOY_DIR"
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "Production checkout has tracked local changes; refusing destructive rollout."
+  git status --short
+  exit 1
+fi
+
+if docker compose --env-file .env ps -q expert-my-rules 2>/dev/null | grep -q .; then
+  docker compose --env-file .env exec -T expert-my-rules python - > "$RESUME_FILE" <<'PY'
+import sqlite3
+from pathlib import Path
+for db in Path('/data/workspaces').glob('*/ledger.sqlite3'):
+    conn=sqlite3.connect(db, timeout=30)
+    try:
+        rows=conn.execute("SELECT id,status FROM jobs WHERE continuous=1 AND status IN ('RUNNING','QUEUED','PAUSED','CANCEL_REQUESTED') ORDER BY created_at").fetchall()
+        for jid,status in rows:
+            print(f'{db.parent.name}|{jid}|{status}')
+    finally:
+        conn.close()
+PY
+fi
+
+echo "ACTIVE_BEFORE"
+cat "$RESUME_FILE" || true
+
+# Best-effort checkpoint and in-flight public stream snapshot before interruption.
+while IFS='|' read -r PROJECT JID STATUS; do
+  [ -n "$PROJECT" ] || continue
+  curl -fsS --max-time 10 -X POST "http://127.0.0.1:${PORT}/project/${PROJECT}/checkpoint" >/dev/null 2>&1 || true
+done < "$RESUME_FILE"
+
+# Explicitly authorized destructive boundary: completed artifacts stay immutable;
+# only in-flight attempts are INTERRUPTED and their tasks reopen for durable resume.
+if docker compose --env-file .env ps -q expert-my-rules 2>/dev/null | grep -q .; then
+  docker compose --env-file .env exec -T expert-my-rules python - <<'PY'
+import json, sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+now=datetime.now(timezone.utc).isoformat()
+for db in Path('/data/workspaces').glob('*/ledger.sqlite3'):
+    conn=sqlite3.connect(db, timeout=30)
+    try:
+        jobs=conn.execute("SELECT id FROM jobs WHERE continuous=1 AND status IN ('RUNNING','QUEUED','PAUSED','CANCEL_REQUESTED')").fetchall()
+        for (jid,) in jobs:
+            conn.execute("UPDATE jobs SET status='CANCELLED',detail=?,updated_at=? WHERE id=?",('interrupted by authorized unified-control rollout; durable state preserved',now,jid))
+        tasks=conn.execute("SELECT id,metadata_json FROM tasks WHERE status='IN_PROGRESS'").fetchall()
+        for task_id,metadata_json in tasks:
+            try: meta=json.loads(metadata_json or '{}')
+            except Exception: meta={}
+            meta['interrupt_recoveries']=int(meta.get('interrupt_recoveries',0))+1
+            meta['interrupted_by']='authorized unified-control rollout'
+            conn.execute("UPDATE tasks SET status='OPEN',metadata_json=?,updated_at=? WHERE id=?",(json.dumps(meta),now,task_id))
+            conn.execute("UPDATE attempts SET status='INTERRUPTED',error=CASE WHEN error='' THEN 'interrupted by authorized unified-control rollout' ELSE error END,finished_at=? WHERE task_id=? AND status='RUNNING'",(now,task_id))
+        conn.execute("INSERT INTO events(ts,kind,task_id,payload_json) VALUES(?,?,NULL,?)",(now,'deployment_forced_cancel',json.dumps({'reason':'authorized unified-control rollout','resume_expected':True})))
+        conn.commit()
+    finally:
+        conn.close()
+PY
+fi
+
+docker compose --env-file .env --profile local-inference stop -t 2 expert-my-rules expert-observer expert-lab ollama 2>/dev/null || true
+
+git fetch origin main
+git checkout main
+git reset --hard "$TARGET_SHA"
+
+docker network inspect home-lab >/dev/null 2>&1 || docker network create home-lab
+mkdir -p lab-data
+AWB_OLLAMA_CPU_FRACTION="$(awk -F= '$1=="AWB_OLLAMA_CPU_FRACTION" {print $2}' .env | tail -n1)"; AWB_OLLAMA_CPU_FRACTION="${AWB_OLLAMA_CPU_FRACTION:-0.85}"
+AWB_SIDE_PROJECT_CPU_FRACTION="$(awk -F= '$1=="AWB_SIDE_PROJECT_CPU_FRACTION" {print $2}' .env | tail -n1)"; AWB_SIDE_PROJECT_CPU_FRACTION="${AWB_SIDE_PROJECT_CPU_FRACTION:-0.15}"
+export AWB_OLLAMA_CPU_FRACTION AWB_SIDE_PROJECT_CPU_FRACTION
+export AWB_BUILD_SHA="$TARGET_SHA"
+POLICY_OUTPUT="$(bash ops/apply_acepc_resource_policy.sh)"
+printf '%s\n' "$POLICY_OUTPUT"
+AWB_OLLAMA_CPUS="$(printf '%s\n' "$POLICY_OUTPUT" | awk -F= '$1=="AWB_OLLAMA_CPUS" {print $2}' | tail -n1)"
+test -n "$AWB_OLLAMA_CPUS"
+export AWB_OLLAMA_CPUS
+
+docker compose --env-file .env --profile local-inference build expert-my-rules
+docker compose --env-file .env --profile local-inference up -d --no-build --force-recreate ollama expert-my-rules expert-observer expert-lab
+
+MAIN_OK=0; OBS_OK=0; LAB_OK=0
+for _ in $(seq 1 120); do
+  curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/health" >/dev/null && MAIN_OK=1 || true
+  curl -fsS --max-time 3 "http://127.0.0.1:${OBSERVER_PORT}/health" >/dev/null && OBS_OK=1 || true
+  curl -fsS --max-time 3 "http://127.0.0.1:${LAB_PORT}/health" >/dev/null && LAB_OK=1 || true
+  if [ "$MAIN_OK" = 1 ] && [ "$OBS_OK" = 1 ] && [ "$LAB_OK" = 1 ]; then break; fi
+  sleep 2
+done
+test "$MAIN_OK" = 1 && test "$OBS_OK" = 1 && test "$LAB_OK" = 1
+
+# Paid API stays locked after deployment. User unlock is always explicit per project.
+docker compose --env-file .env exec -T expert-my-rules python -m awb.core.acepc_policy --all --lock-cloud
+
+# Materialize project defaults so existing projects use CPU/context quotas on their
+# first post-upgrade local generation, without requiring a visit to Setup.
+docker compose --env-file .env exec -T expert-my-rules python - <<'PY'
+from pathlib import Path
+from awb.core.resource_policy import load_project_policy, save_project_policy
+for root in Path('/data/workspaces').iterdir():
+    if (root/'project.yaml').exists() and (root/'ledger.sqlite3').exists():
+        try: save_project_policy(root, load_project_policy(root))
+        except Exception as exc: print(f'POLICY_WARN {root.name}: {exc}')
+PY
+
+# Relaunch every project that was active before interruption. The unified launch
+# endpoint enforces the aggregate system CPU/RAM/project-count envelope.
+while IFS='|' read -r PROJECT OLDJID OLDSTATUS; do
+  [ -n "$PROJECT" ] || continue
+  echo "RESUME_PROJECT=${PROJECT} previous=${OLDJID}/${OLDSTATUS}"
+  curl -fsS -X POST "http://127.0.0.1:${PORT}/project/${PROJECT}/launch" >/dev/null
+done < "$RESUME_FILE"
+sleep 5
+
+# Product-level acceptance checks.
+ROOT_HTML="$(curl -fsS --max-time 10 "http://127.0.0.1:${PORT}/")"
+printf '%s' "$ROOT_HTML" | grep -q 'Risorse Expert My Rules'
+printf '%s' "$ROOT_HTML" | grep -q 'Progetti'
+while IFS='|' read -r PROJECT OLDJID OLDSTATUS; do
+  [ -n "$PROJECT" ] || continue
+  DASH="$(curl -fsS --max-time 10 "http://127.0.0.1:${PORT}/project/${PROJECT}")"
+  printf '%s' "$DASH" | grep -q 'Ultime attività'
+  printf '%s' "$DASH" | grep -q 'Task'
+  curl -fsS --max-time 10 "http://127.0.0.1:${PORT}/project/${PROJECT}/setup" | grep -q 'North Star'
+  STATE="$(curl -fsS --max-time 10 "http://127.0.0.1:${PORT}/project/${PROJECT}/live")"
+  printf '%s' "$STATE" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["overall_status"]=="RUNNING", d; print(json.dumps({"project":d["project"],"status":d["overall_status"],"current_task":d.get("current_task"),"allocation":d.get("allocation"),"runtime_progress":d.get("runtime_progress")},ensure_ascii=False))'
+done < "$RESUME_FILE"
+
+NANO_CPUS="$(docker inspect --format '{{.HostConfig.NanoCpus}}' "$(docker compose --env-file .env ps -q ollama)")"
+echo "OLLAMA_NANO_CPUS=${NANO_CPUS}"
+echo "UNIFIED_CONTROL_ROLLOUT_COMPLETE=1"
