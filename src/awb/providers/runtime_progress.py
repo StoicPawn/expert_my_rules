@@ -67,11 +67,22 @@ def set_progress(model: str, payload: dict[str, Any]) -> None:
 
 def clear_progress(model: str) -> None:
     with _LOCK:
-        stale = [key for key, value in _PROGRESS.items() if key.endswith(f'::{model}')]
+        stale = [key for key in _PROGRESS if key.endswith(f'::{model}')]
         for key in stale:
             _PROGRESS.pop(key, None)
-    # Do not delete job-scoped files by model name: another process can be using
-    # the same resident model. Job lifecycle cleanup owns those files.
+    # Preserve the old single-file cleanup contract for legacy clients/tests, but
+    # never delete job-scoped files here: another project can be using the same
+    # resident model. Job lifecycle cleanup owns those isolated files.
+    base = _shared_path()
+    if base is None:
+        return
+    try:
+        if base.exists():
+            doc = json.loads(base.read_text(encoding='utf-8'))
+            if str(doc.get('model_key') or '') == str(model):
+                base.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def clear_progress_for_job(job_id: str) -> None:
