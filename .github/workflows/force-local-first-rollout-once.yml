@@ -1,0 +1,189 @@
+name: force-local-first-rollout-once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.force-local-first-rollout-once'
+      - '.github/workflows/force-local-first-rollout-once.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: expert-my-rules-local-main
+  cancel-in-progress: true
+
+jobs:
+  rollout:
+    runs-on: [self-hosted, linux, expert-local]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Verify release before touching production
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .force-local-first-rollout-once
+          rm -rf .gha-venv
+          python3 -m venv .gha-venv
+          export PATH="$PWD/.gha-venv/bin:$PATH"
+          python -m pip install --upgrade pip >/dev/null
+          pip install -e . >/dev/null
+          python -m compileall -q src
+          python -m unittest discover -s tests -v
+          docker compose --env-file .env.example config >/dev/null
+
+      - name: Cancel current task, deploy endurance runtime, resume project
+        shell: bash
+        env:
+          DEPLOY_DIR: /home/stoicpawn/projects/expert_my_rules
+        run: |
+          set -euo pipefail
+          test -d "$DEPLOY_DIR/.git"
+          test -f "$DEPLOY_DIR/.env"
+          PORT="$(awk -F= '$1=="AWB_PORT" {print $2}' "$DEPLOY_DIR/.env" | tail -n1)"; PORT="${PORT:-8100}"
+          OBSERVER_PORT="$(awk -F= '$1=="AWB_OBSERVER_PORT" {print $2}' "$DEPLOY_DIR/.env" | tail -n1)"; OBSERVER_PORT="${OBSERVER_PORT:-8101}"
+          LAB_PORT="$(awk -F= '$1=="AWB_LAB_PORT" {print $2}' "$DEPLOY_DIR/.env" | tail -n1)"; LAB_PORT="${LAB_PORT:-8102}"
+
+          cd "$DEPLOY_DIR"
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            echo "Production checkout has tracked local changes; refusing destructive rollout."
+            git status --short
+            exit 1
+          fi
+
+          TARGET=""
+          if docker compose --env-file .env ps -q expert-my-rules 2>/dev/null | grep -q .; then
+            TARGET="$(docker compose --env-file .env exec -T expert-my-rules python - <<'PY'
+          import sqlite3
+          from pathlib import Path
+          rows=[]
+          for db in Path('/data/workspaces').glob('*/ledger.sqlite3'):
+              conn=sqlite3.connect(db, timeout=20)
+              try:
+                  row=conn.execute("SELECT id,status,updated_at FROM jobs WHERE continuous=1 ORDER BY updated_at DESC LIMIT 1").fetchone()
+                  if row:
+                      rows.append((str(row[2] or ''), db.parent.name, str(row[0]), str(row[1])))
+              finally:
+                  conn.close()
+          if rows:
+              _,project,jid,status=max(rows)
+              print(f'{project}|{jid}|{status}')
+          PY
+            )"
+            TARGET="$(printf '%s' "$TARGET" | tail -n1 | tr -d '\r')"
+          fi
+          echo "SELECTED_TARGET=${TARGET:-none}"
+
+          TARGET_PROJECT="$(printf '%s' "$TARGET" | cut -d'|' -f1)"
+          TARGET_JOB="$(printf '%s' "$TARGET" | cut -d'|' -f2)"
+
+          # Best-effort structured snapshot with the currently installed runtime.
+          if [ -n "$TARGET_PROJECT" ]; then
+            curl -fsS --max-time 10 -X POST "http://127.0.0.1:${PORT}/project/${TARGET_PROJECT}/checkpoint" >/dev/null 2>&1 || true
+          fi
+
+          # Explicit user authorization: terminate the current inference. Completed
+          # attempts/artifacts stay immutable; only the in-flight attempt is marked
+          # INTERRUPTED and its task is reopened for the upgraded resume logic.
+          if docker compose --env-file .env ps -q expert-my-rules 2>/dev/null | grep -q .; then
+            docker compose --env-file .env exec -T expert-my-rules python - "$TARGET_PROJECT" "$TARGET_JOB" <<'PY'
+          import json, sqlite3, sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+          project=sys.argv[1] if len(sys.argv)>1 else ''
+          target_job=sys.argv[2] if len(sys.argv)>2 else ''
+          if project:
+              db=Path('/data/workspaces')/project/'ledger.sqlite3'
+              conn=sqlite3.connect(db, timeout=30)
+              now=datetime.now(timezone.utc).isoformat()
+              try:
+                  if target_job:
+                      conn.execute("UPDATE jobs SET status='CANCELLED',detail=?,updated_at=? WHERE id=?", ('cancelled by authorized local-first endurance rollout',now,target_job))
+                  for task_id,meta_json in conn.execute("SELECT id,metadata_json FROM tasks WHERE status='IN_PROGRESS'").fetchall():
+                      try: meta=json.loads(meta_json or '{}')
+                      except Exception: meta={}
+                      meta['interrupt_recoveries']=int(meta.get('interrupt_recoveries',0))+1
+                      meta['interrupted_by']='authorized local-first endurance rollout'
+                      conn.execute("UPDATE tasks SET status='OPEN',metadata_json=?,updated_at=? WHERE id=?",(json.dumps(meta),now,task_id))
+                      conn.execute("UPDATE attempts SET status='INTERRUPTED',error=CASE WHEN error='' THEN 'interrupted by authorized local-first endurance rollout' ELSE error END,finished_at=? WHERE task_id=? AND status='RUNNING'",(now,task_id))
+                  conn.execute("INSERT INTO events(ts,kind,task_id,payload_json) VALUES(?,?,NULL,?)",(now,'local_first_rollout_cancel',json.dumps({'job_id':target_job,'reason':'explicit user authorization'})))
+                  conn.commit()
+              finally:
+                  conn.close()
+          PY
+          fi
+
+          docker compose --env-file .env --profile local-inference stop -t 2 expert-my-rules expert-observer expert-lab ollama 2>/dev/null || true
+
+          git fetch origin main
+          git checkout main
+          git reset --hard "${GITHUB_SHA}"
+
+          set_env() {
+            local key="$1" value="$2"
+            if grep -q "^${key}=" .env; then
+              sed -i "s|^${key}=.*|${key}=${value}|" .env
+            else
+              printf '%s=%s\n' "$key" "$value" >> .env
+            fi
+          }
+          set_env AWB_INFERENCE_MODE local
+          set_env AWB_LOCAL_MODEL qwen3:4b
+          set_env AWB_PLANNER_MODEL qwen3:4b
+          set_env AWB_DIRECTOR_MODEL qwen3:4b
+          set_env AWB_WORKER_MODEL qwen3:4b
+          set_env AWB_REVIEWER_MODEL qwen3:4b
+          set_env AWB_VERIFIER_MODEL qwen3:4b
+          set_env AWB_OLLAMA_PROGRESS_EVENT_SECONDS 1
+          set_env AWB_OLLAMA_DIRECTOR_THINK false
+          set_env AWB_OLLAMA_WORKER_THINK true
+          set_env AWB_OLLAMA_REVIEWER_THINK true
+          set_env AWB_OLLAMA_VERIFIER_THINK false
+          set_env OLLAMA_MAX_LOADED_MODELS 1
+          set_env OLLAMA_NUM_PARALLEL 1
+          set_env OLLAMA_KEEP_ALIVE 30m
+
+          docker network inspect home-lab >/dev/null 2>&1 || docker network create home-lab
+          mkdir -p lab-data
+          AWB_OLLAMA_CPU_FRACTION="$(awk -F= '$1=="AWB_OLLAMA_CPU_FRACTION" {print $2}' .env | tail -n1)"; AWB_OLLAMA_CPU_FRACTION="${AWB_OLLAMA_CPU_FRACTION:-0.85}"
+          AWB_SIDE_PROJECT_CPU_FRACTION="$(awk -F= '$1=="AWB_SIDE_PROJECT_CPU_FRACTION" {print $2}' .env | tail -n1)"; AWB_SIDE_PROJECT_CPU_FRACTION="${AWB_SIDE_PROJECT_CPU_FRACTION:-0.15}"
+          export AWB_OLLAMA_CPU_FRACTION AWB_SIDE_PROJECT_CPU_FRACTION
+          export AWB_BUILD_SHA="$GITHUB_SHA"
+          POLICY_OUTPUT="$(bash ops/apply_acepc_resource_policy.sh)"
+          printf '%s\n' "$POLICY_OUTPUT"
+          AWB_OLLAMA_CPUS="$(printf '%s\n' "$POLICY_OUTPUT" | awk -F= '$1=="AWB_OLLAMA_CPUS" {print $2}' | tail -n1)"
+          export AWB_OLLAMA_CPUS
+
+          docker compose --env-file .env --profile local-inference build expert-my-rules
+          docker compose --env-file .env --profile local-inference up -d --no-build --force-recreate ollama expert-my-rules expert-observer expert-lab
+
+          MAIN_OK=0; OBS_OK=0; LAB_OK=0
+          for _ in $(seq 1 120); do
+            curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/health" >/dev/null && MAIN_OK=1 || true
+            curl -fsS --max-time 3 "http://127.0.0.1:${OBSERVER_PORT}/health" >/dev/null && OBS_OK=1 || true
+            curl -fsS --max-time 3 "http://127.0.0.1:${LAB_PORT}/health" >/dev/null && LAB_OK=1 || true
+            if [ "$MAIN_OK" = 1 ] && [ "$OBS_OK" = 1 ] && [ "$LAB_OK" = 1 ]; then break; fi
+            sleep 2
+          done
+          test "$MAIN_OK" = 1 && test "$OBS_OK" = 1 && test "$LAB_OK" = 1
+
+          # Migrate every existing project to the single-model endurance profile and
+          # explicitly lock paid API access. The user may unlock it later in the UI.
+          docker compose --env-file .env exec -T expert-my-rules python -m awb.core.acepc_policy --all --lock-cloud
+
+          if [ -n "$TARGET_PROJECT" ]; then
+            curl -fsS -X POST "http://127.0.0.1:${PORT}/project/${TARGET_PROJECT}/checkpoint" >/dev/null || true
+            curl -fsS -X POST "http://127.0.0.1:${PORT}/project/${TARGET_PROJECT}/launch" >/dev/null
+            sleep 5
+            echo "POST_DEPLOY_STATE"
+            curl -fsS "http://127.0.0.1:${OBSERVER_PORT}/project/${TARGET_PROJECT}/state" | python -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"build_sha":d.get("build_sha"),"overall_status":d.get("overall_status"),"job":d.get("job"),"current_task":d.get("current_task"),"focused_task":d.get("focused_task"),"runtime_progress":d.get("runtime_progress"),"resources":d.get("resources"),"budget":{"mode":(d.get("budget") or {}).get("mode"),"requested_enabled":(d.get("budget") or {}).get("requested_enabled")}},indent=2))'
+          fi
+
+          NANO_CPUS="$(docker inspect --format '{{.HostConfig.NanoCpus}}' "$(docker compose --env-file .env ps -q ollama)")"
+          echo "OLLAMA_NANO_CPUS=${NANO_CPUS}"
+          echo "LOCAL_FIRST_ROLLOUT_COMPLETE=1"
