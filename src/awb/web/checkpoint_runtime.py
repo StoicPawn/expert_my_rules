@@ -6,15 +6,25 @@ from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from awb.core.checkpoints import build_project_state, latest_checkpoint, write_checkpoint
+from awb.core.cloud_budget import load_control
 from awb.core.focused_cloud_orchestrator import FocusedCloudAwareOrchestrator
 from awb.core.models import JobStatus
+from awb.core.resume_trace import capture_stream_trace
 from awb.core.storage import Ledger
 from awb.web import runtime_entry
 from awb.web.control_v3 import _root, control_app
 
 
 class CheckpointedFocusedOrchestrator(FocusedCloudAwareOrchestrator):
-    """Focused lifecycle plus durable outcome checkpoint after every completed step."""
+    """Focused reviewer loop + durable checkpoints + explicit-only paid API."""
+
+    def _cloud_important(self, role, task):
+        # AUTO is intentionally treated as local-only in endurance mode. Paid API
+        # calls are possible only after the user presses SBLOCCA API / FORCE.
+        control = load_control(self.workspace.root)
+        if control.mode != 'force':
+            return False
+        return super()._cloud_important(role, task)
 
     def step(self):
         try:
@@ -39,9 +49,6 @@ class CheckpointedFocusedOrchestrator(FocusedCloudAwareOrchestrator):
         return result
 
 
-# The continuous runtime imported CloudAwareOrchestrator directly. Replace that
-# module-global binding so production jobs use both the focused reviewer/rework
-# lifecycle and automatic durable checkpoints.
 runtime_entry.CloudAwareOrchestrator = CheckpointedFocusedOrchestrator
 
 
@@ -88,7 +95,7 @@ def checkpoint_project_page(request: Request, project: str):
     <form method='post' action='/project/{project}/checkpoint'><button class='secondary'>SALVA CHECKPOINT ORA</button></form>
     <form method='post' action='/project/{project}/checkpoint-pause'><button>CHECKPOINT & PAUSA SICURA</button></form>
   </div>
-  <p class='small muted'>Il checkpoint salva anche risultati negativi, obiezioni del reviewer, verifiche, artifact, strategia successiva e focus chain. Se una chiamata modello è già in volo, PAUSA SICURA la lascia terminare: il checkpoint automatico successivo diventa il nuovo punto consistente di ripresa.</p>
+  <p class='small muted'>Il checkpoint salva risultati positivi e negativi, obiezioni, verifiche, artifact, strategia, focus chain e la generazione locale visibile in corso. Il reasoning nascosto non viene salvato.</p>
 </div>
 """
     anchor = '<h2>Budget API di questo progetto</h2>'
@@ -102,6 +109,10 @@ def checkpoint_project_page(request: Request, project: str):
 @control_app.post('/project/{project}/checkpoint')
 def checkpoint_now(project: str):
     root = _root(project)
+    ledger = Ledger(root / 'ledger.sqlite3')
+    job = ledger.latest_job()
+    if job:
+        capture_stream_trace(root, job.get('id'), reason='manual-checkpoint', interrupted=False)
     write_checkpoint(root, reason='manual-checkpoint', manual=True)
     return RedirectResponse(f'/project/{project}?tab=runtime', 303)
 
@@ -114,6 +125,7 @@ def checkpoint_and_pause(project: str):
     if not job:
         write_checkpoint(root, reason='manual-checkpoint-no-running-job', manual=True)
         return RedirectResponse(f'/project/{project}?tab=runtime', 303)
+    capture_stream_trace(root, job.get('id'), reason='manual-checkpoint-pause-requested', interrupted=False)
     if job['status'] in {JobStatus.RUNNING.value, JobStatus.QUEUED.value}:
         ledger.update_job(job['id'], status=JobStatus.PAUSED, detail='checkpoint pause requested; waiting for safe step boundary')
         ledger.event('checkpoint_pause_requested', {'job_id': job['id']})
