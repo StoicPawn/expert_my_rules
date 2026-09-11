@@ -3,7 +3,8 @@ from __future__ import annotations
 from fastapi.responses import JSONResponse
 
 from awb.core.models import JobStatus
-from awb.web.dashboard_app import _state as _base_state, dashboard_app
+from awb.core.storage import Ledger
+from awb.web.dashboard_app import _root, _state as _base_state, dashboard_app
 
 _TERMINAL = {
     JobStatus.CANCELLED.value,
@@ -34,15 +35,10 @@ def coherent_state(project: str):
     status = str(job.get('status') or 'NOT STARTED')
     setup = state.get('setup') or {}
 
-    # Runtime telemetry is only meaningful for an active run/setup. A terminal job
-    # must never keep displaying a stale "worker · generating" record left by a
-    # process that has already stopped or failed.
     if status in _TERMINAL:
         state['runtime_progress'] = {}
         state['current_task'] = None
 
-    # Expose the two state machines explicitly so the UI/API cannot conflate
-    # "configuration generated successfully" with "autonomous run is healthy".
     state['configuration_status'] = str(setup.get('status') or 'NOT_STARTED')
     state['run_status'] = status
     if status == JobStatus.FAILED.value:
@@ -51,6 +47,8 @@ def coherent_state(project: str):
         state['overall_status'] = 'STOPPED'
     elif status == JobStatus.COMPLETE.value:
         state['overall_status'] = 'COMPLETE'
+    elif status == JobStatus.PAUSED.value:
+        state['overall_status'] = 'PAUSED'
     elif status == JobStatus.RUNNING.value:
         state['overall_status'] = 'RUNNING'
     elif setup.get('status') in {'RUNNING', 'QUEUED'}:
@@ -58,27 +56,53 @@ def coherent_state(project: str):
     else:
         state['overall_status'] = status
 
-    # Old relaunch builds could leave several identical OPEN reassessment cards.
-    # Keep at most the current/most relevant one in the live plan even before the
-    # persistent cleanup runs on the next launch/deploy.
+    ledger = Ledger(_root(project) / 'ledger.sqlite3')
+    rich = {task.id: task for task in ledger.list_tasks()}
     tasks = list(state.get('tasks') or [])
     seen_relaunch = False
     compact = []
-    for task in tasks:
-        if task.get('created_by') == 'relaunch':
+    for row in tasks:
+        if row.get('created_by') == 'relaunch':
             if seen_relaunch:
                 continue
             seen_relaunch = True
-        compact.append(task)
+        task = rich.get(str(row.get('id') or ''))
+        if task is not None:
+            meta = task.metadata or {}
+            row = {
+                **row,
+                'lifecycle_phase': str(meta.get('lifecycle_phase') or ''),
+                'focus_chain_id': str(meta.get('focus_chain_id') or ''),
+                'focus_chain_active': bool(meta.get('focus_chain_active', False)),
+                'critical_objections': list(meta.get('critical_objections') or [])[:12],
+                'review_recommendations': list(meta.get('last_review_recommendations') or [])[:12],
+                'artifact': str(meta.get('artifact') or ''),
+                'interrupted_resume': dict(meta.get('interrupted_resume') or {}),
+            }
+        compact.append(row)
     state['tasks'] = compact
     state['total_tasks'] = len(compact)
     state['done_tasks'] = sum(1 for task in compact if task.get('status') == 'DONE')
 
+    current = next((task for task in compact if task.get('status') == 'IN_PROGRESS'), None)
+    if status not in _TERMINAL:
+        state['current_task'] = current
+    state['focused_task'] = next(
+        (task for task in compact if task.get('focus_chain_active') and task.get('status') not in {'DONE', 'REJECTED'}),
+        None,
+    )
+    state['local_endurance'] = {
+        'single_model_serial': True,
+        'busy_queue_unbounded': True,
+        'api_manual_only': True,
+        'slow_generation_is_failure': False,
+    }
     return JSONResponse(state, headers={'Cache-Control': 'no-store'})
 
 
-# Presentation-only overlay. It replaces the observer project page while keeping
-# the state endpoint above stable for tests and external consumers.
 from awb.web.dashboard_story import install_agent_story_dashboard
-
 install_agent_story_dashboard(dashboard_app)
+
+# Final presentation layer: richer second-by-second output/tool/checkpoint view.
+from awb.web.dashboard_deep_live import install_deep_live_dashboard
+install_deep_live_dashboard(dashboard_app)
