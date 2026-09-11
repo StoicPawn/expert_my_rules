@@ -1,0 +1,45 @@
+name: force-unified-control-rollout-v2-once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.force-unified-control-rollout-v2-once'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: expert-my-rules-force-unified-rollout-v2
+  cancel-in-progress: false
+
+jobs:
+  rollout:
+    runs-on: [self-hosted, linux, expert-local]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Verify release before interrupting production
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .force-unified-control-rollout-v2-once
+          rm -rf .gha-venv
+          python3 -m venv .gha-venv
+          export PATH="$PWD/.gha-venv/bin:$PATH"
+          python -m pip install --upgrade pip >/dev/null
+          pip install -e . >/dev/null
+          python -m compileall -q src
+          python -m unittest discover -s tests -v
+          docker compose --env-file .env.example config >/dev/null
+          bash -n ops/force_unified_control_rollout_once.sh
+
+      - name: Deploy unified control and resume projects
+        shell: bash
+        env:
+          DEPLOY_DIR: /home/stoicpawn/projects/expert_my_rules
+          TARGET_SHA: ${{ github.sha }}
+        run: bash ops/force_unified_control_rollout_once.sh
