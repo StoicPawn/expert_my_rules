@@ -38,24 +38,27 @@ class ControlCenterV3Tests(unittest.TestCase):
         self.assertEqual(response.status_code, 303)
         self.assertEqual(response.headers['location'], '/')
 
-    def test_cancelled_project_can_be_relaunched(self):
+    def test_cancelled_project_can_be_relaunched_without_erasing_scientific_state(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'AWB_WORKSPACES_DIR': tmp}, clear=False):
             root = Path(tmp) / 'rerunnable'
-            write_workspace(root, get_template('research', 'rerunnable', 'Prove a theorem and produce a research paper.'))
+            manifest = get_template('research', 'rerunnable', 'Prove a theorem and produce a research paper.')
+            write_workspace(root, manifest)
             ledger = Ledger(root / 'ledger.sqlite3')
             old_job = ledger.create_job(0, 0, continuous=True)
             ledger.update_job(old_job, status=JobStatus.CANCELLED, detail='cancelled')
-            for gate in get_template('research', 'rerunnable', 'Prove a theorem and produce a research paper.')['gates']:
-                ledger.set_gate(gate['id'], True, 'old run')
-            with patch('awb.web.control_v3._start'):
+            for gate in manifest['gates']:
+                ledger.set_gate(gate['id'], True, 'already established')
+            with patch('awb.web.runtime_entry._start_process', return_value=None):
                 client = TestClient(control_app)
                 response = client.post('/project/rerunnable/launch', follow_redirects=False)
             self.assertEqual(response.status_code, 303)
-            latest = Ledger(root / 'ledger.sqlite3').latest_job()
+            after = Ledger(root / 'ledger.sqlite3')
+            latest = after.latest_job()
             self.assertNotEqual(latest['id'], old_job)
             self.assertEqual(latest['status'], JobStatus.RUNNING.value)
-            self.assertTrue(any(t.created_by == 'relaunch' for t in Ledger(root / 'ledger.sqlite3').list_tasks()))
-            self.assertFalse(any(v['passed'] for v in Ledger(root / 'ledger.sqlite3').gate_state().values()))
+            self.assertFalse(any(t.created_by == 'relaunch' for t in after.list_tasks()))
+            self.assertTrue(all(v['passed'] for v in after.gate_state().values()))
+            self.assertTrue(any(e['kind'] == 'project_resumed_from_ledger' for e in after.recent_events(20)))
 
     def test_v3_routes_replace_blocking_create_route(self):
         matches = [
