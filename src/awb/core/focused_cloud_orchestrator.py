@@ -1,25 +1,18 @@
 from __future__ import annotations
 
+import json
+
 from awb.core.cloud_orchestrator import CloudAwareOrchestrator
 from awb.core.models import Task, TaskStatus
 
 
 class FocusedCloudAwareOrchestrator(CloudAwareOrchestrator):
-    """Keep scientific work focused until review objections are resolved.
+    """Keep one scientific focus chain active until review objections are resolved.
 
-    A reviewer rejection is not treated as permission to wander to unrelated open
-    work. The current chain stays active through worker -> reviewer/verifier ->
-    rework until it is closed, explicitly reframed/rejected, or decomposed into
-    prerequisite tasks. In the decomposition case only the prerequisite chain may
-    run ahead of the blocked parent; when the prerequisites terminate, the parent
-    is automatically reopened for re-review.
-
-    Existing TaskStatus values are preserved for backward compatibility. The more
-    precise lifecycle is stored in metadata as ``lifecycle_phase``:
-      - REWORK: same task must be attempted again against reviewer objections
-      - WAITING_ON_DEPENDENCY: parent waits only for its recovery children
-      - PREREQUISITE: child created specifically to unblock a focused parent
-      - REFRAMED_REPLACEMENT: explicit replacement for a superseded formulation
+    Reviewer rejection is rework, not permission to wander to unrelated tasks. The
+    only work allowed ahead of the current task is an explicit prerequisite created
+    to unblock it. Interrupted visible model work is also fed back into the next
+    Worker prompt so a long local generation is not intellectually discarded.
     """
 
     _FOCUS_PHASES = {'REWORK', 'PREREQUISITE', 'REFRAMED_REPLACEMENT'}
@@ -66,9 +59,6 @@ class FocusedCloudAwareOrchestrator(CloudAwareOrchestrator):
         root_id = str(task.metadata.get('focus_chain_id') or task.id)
 
         if action == 'retry':
-            # Keep this completed attempt durably BLOCKED until finish_attempt()
-            # records it as a scientific attempt. choose_next_task() immediately
-            # reopens the same focused task as REWORK before unrelated OPEN work.
             task.status = TaskStatus.BLOCKED
             task.metadata['focus_chain_active'] = True
             task.metadata['focus_chain_id'] = root_id
@@ -99,7 +89,6 @@ class FocusedCloudAwareOrchestrator(CloudAwareOrchestrator):
         return plan
 
     def _adopt_legacy_recovery_state(self) -> None:
-        """Make old/current BLOCKED recovery records obey the focused lifecycle."""
         for parent in self.ledger.list_tasks([TaskStatus.BLOCKED]):
             waiting = list(parent.metadata.get('waiting_on_recovery_tasks') or [])
             root_id = str(parent.metadata.get('focus_chain_id') or parent.id)
@@ -121,9 +110,6 @@ class FocusedCloudAwareOrchestrator(CloudAwareOrchestrator):
                         self._mark_focus(child, phase, root_id=root_id)
                 continue
 
-            # A retryable reviewed task becomes REWORK immediately. This applies
-            # both to old persisted BLOCKED rows and to the attempt that just
-            # finished in the current process.
             if parent.metadata.get('next_strategy') or parent.metadata.get('last_recovery_action') == 'retry':
                 parent.status = TaskStatus.OPEN
                 self._mark_focus(parent, 'REWORK', root_id=root_id)
@@ -170,16 +156,33 @@ class FocusedCloudAwareOrchestrator(CloudAwareOrchestrator):
     def _recovery_context(self, task: Task):
         base = super()._recovery_context(task)
         outcomes = task.metadata.get('dependency_outcomes') or []
-        if not outcomes:
-            return base
-        return base + '\n\nRECOVERY DEPENDENCY OUTCOMES:\n' + str(outcomes)
+        if outcomes:
+            base += '\n\nRECOVERY DEPENDENCY OUTCOMES:\n' + json.dumps(outcomes, ensure_ascii=False, indent=2)
+
+        interrupted = task.metadata.get('interrupted_resume') or {}
+        if interrupted:
+            base += (
+                '\n\nINTERRUPTED LOCAL GENERATION — PRESERVE USEFUL WORK:\n'
+                + json.dumps({
+                    'artifact': interrupted.get('artifact', ''),
+                    'role': interrupted.get('role', ''),
+                    'model': interrupted.get('model', ''),
+                    'prompt_tokens': interrupted.get('prompt_tokens'),
+                    'output_tokens': interrupted.get('output_tokens'),
+                    'partial_visible_output': str(interrupted.get('visible_output_tail') or '')[-16000:],
+                    'instruction': (
+                        'Treat this as unfinished scratch work from the same task. Validate it, reuse correct parts, '
+                        'and continue rather than mechanically restarting from zero.'
+                    ),
+                }, ensure_ascii=False, indent=2)
+            )
+        return base
 
     def _focused_open(self) -> list[Task]:
-        tasks = []
-        for task in self.ledger.list_tasks([TaskStatus.OPEN]):
-            if task.metadata.get('focus_chain_active') or task.metadata.get('lifecycle_phase') in self._FOCUS_PHASES:
-                tasks.append(task)
-        return tasks
+        return [
+            task for task in self.ledger.list_tasks([TaskStatus.OPEN])
+            if task.metadata.get('focus_chain_active') or task.metadata.get('lifecycle_phase') in self._FOCUS_PHASES
+        ]
 
     def _focused_errors(self) -> list[Task]:
         return [
@@ -188,8 +191,6 @@ class FocusedCloudAwareOrchestrator(CloudAwareOrchestrator):
         ]
 
     def choose_next_task(self):
-        # First normalize states left by older versions, then resolve dependency
-        # chains. This makes deployment safe even for an already-running project.
         self._adopt_legacy_recovery_state()
         self._release_ready_parents()
 
@@ -207,8 +208,6 @@ class FocusedCloudAwareOrchestrator(CloudAwareOrchestrator):
             )
             return task
 
-        # A technical error inside a focused chain must be retried before unrelated
-        # work as well; technical failures never consume a scientific attempt.
         focused_errors = self._focused_errors()
         if focused_errors:
             task = focused_errors[0]

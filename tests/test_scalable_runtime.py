@@ -11,18 +11,18 @@ from awb.templates.templates import custom_manifest
 
 
 class ScalableRuntimeTests(unittest.TestCase):
-    def test_default_manifest_routes_roles_through_local_compute_node(self):
+    def test_default_manifest_routes_roles_through_one_resident_local_model(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / 'demo'
             write_workspace(root, custom_manifest('demo', 'finish'))
             ws = load_workspace(root)
             router = ModelRouter(ws.manifest)
-            worker = router.candidates('worker')[0]
-            reviewer = router.candidates('reviewer')[0]
-            self.assertEqual(worker.node_id, 'local-ollama')
-            self.assertEqual(worker.model, 'qwen3:4b')
-            self.assertEqual(reviewer.model, 'llama3.2:3b')
+            for role in ('director', 'worker', 'reviewer', 'verifier'):
+                route = router.candidates(role)[0]
+                self.assertEqual(route.node_id, 'local-ollama')
+                self.assertEqual(route.model, 'qwen3:4b')
             self.assertEqual(ws.manifest.runtime.compute_nodes[0].max_concurrency, 1)
+            self.assertEqual(ws.manifest.runtime.scheduler.queue_timeout_seconds, 0.0)
 
     def test_gpu_node_can_replace_acer_by_configuration_only(self):
         with tempfile.TemporaryDirectory() as td:
@@ -86,7 +86,7 @@ class ScalableRuntimeTests(unittest.TestCase):
             snap = {x['node']: x for x in router.snapshot()}
             self.assertGreater(snap['gpu-circuit-test']['cooldown_remaining_seconds'], 0)
 
-    def test_saturated_node_has_bounded_queue_wait(self):
+    def test_saturated_node_has_bounded_queue_wait_when_explicitly_configured(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / 'demo'
             manifest = custom_manifest('demo', 'finish')

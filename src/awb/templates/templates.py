@@ -1,11 +1,15 @@
 from __future__ import annotations
 import os
 
+# The ACEPC has ~8 GB RAM and four logical CPUs. Keeping three different 3-4B
+# models in rotation causes expensive unload/reload churn while adding little value
+# compared with independent role prompts. Default every role to one resident model;
+# manifests remain configurable for future GPU/LM Studio nodes.
 DEFAULT_ROLE_MODELS = {
     'director': 'qwen3:4b',
     'worker': 'qwen3:4b',
-    'reviewer': 'llama3.2:3b',
-    'verifier': 'gemma3:4b',
+    'reviewer': 'qwen3:4b',
+    'verifier': 'qwen3:4b',
 }
 
 ROLE_MODEL_ENV = {
@@ -22,7 +26,7 @@ def model_for_role(role: str) -> str:
     env_name = ROLE_MODEL_ENV[role]
     if os.getenv(env_name):
         return os.environ[env_name]
-    if role in {'director', 'worker'} and os.getenv('AWB_LOCAL_MODEL'):
+    if os.getenv('AWB_LOCAL_MODEL'):
         return os.environ['AWB_LOCAL_MODEL']
     return DEFAULT_ROLE_MODELS[role]
 
@@ -32,7 +36,6 @@ def provider_for_role(role: str) -> dict:
 
 
 def with_role_providers(agents: list[dict]) -> list[dict]:
-    """Attach the configured local model to every standard epistemic role."""
     configured = []
     for agent in agents:
         item = dict(agent)
@@ -54,8 +57,6 @@ def _workflow(validate: bool = True):
 
 
 def _runtime():
-    # The local Acer is merely the first compute node. A future GPU machine can be
-    # inserted ahead of it in role_routes without changing project semantics.
     role_routes = {
         role: [{'node': 'local-ollama', 'model': model_for_role(role), 'priority': 100}]
         for role in DEFAULT_ROLE_MODELS
@@ -69,20 +70,24 @@ def _runtime():
                 'base_url_env': 'OLLAMA_BASE_URL',
                 'max_concurrency': 1,
                 'priority': 100,
-                'tags': ['local', 'small-device'],
+                'tags': ['local', 'small-device', 'acepc'],
             },
         ],
         'role_routes': role_routes,
         'scheduler': {
             'enabled': True,
-            'queue_timeout_seconds': 120.0,
-            'failure_threshold': 2,
-            'cooldown_seconds': 60.0,
+            # <= 0 means wait forever. CPU saturation is normal back-pressure on
+            # the ACEPC and must never turn into a failed scientific task.
+            'queue_timeout_seconds': 0.0,
+            'failure_threshold': 5,
+            'cooldown_seconds': 15.0,
             'load_penalty': 10,
             'failure_penalty': 25,
             'allow_cooldown_probe': True,
         },
         'git': {'enabled': False},
+        # Legacy automatic cloud escalation is permanently off. Paid calls are
+        # controlled only by the explicit manual FORCE API switch.
         'escalation': {
             'enabled': False,
             'cloud_provider': {'kind': 'openai', 'model': 'gpt-5'},
@@ -93,15 +98,16 @@ def _runtime():
             'roles': ['worker', 'reviewer'],
         },
         'max_steps_per_run': 25,
-        'max_minutes_per_run': 60,
+        # No wall-clock orchestration deadline in endurance mode.
+        'max_minutes_per_run': 0,
         'max_task_attempts': 3,
         'adaptive_replan_after_scientific_attempts': 3,
         'technical_retry_limit': 0,
-        'technical_retry_backoff_max_seconds': 300.0,
-        'recovery_history_limit': 8,
-        'max_tool_calls_per_task': 12,
+        'technical_retry_backoff_max_seconds': 600.0,
+        'recovery_history_limit': 20,
+        'max_tool_calls_per_task': 50,
         'continuous_session_steps': 50,
-        'continuous_session_minutes': 30,
+        'continuous_session_minutes': 0,
         'checkpoint_pause_seconds': 2.0,
         'pause_seconds': 0.0,
     }
@@ -109,7 +115,14 @@ def _runtime():
 
 def research_manifest(name, goal):
     agents = with_role_providers([
-        {'id': 'director', 'role': 'director', 'instructions': 'Select the highest-information task. Prefer falsification, unresolved blockers and theorem-critical work.'},
+        {
+            'id': 'director',
+            'role': 'director',
+            'instructions': (
+                'Select one precise highest-information task. State the concrete objective, evidence required, '
+                'and observable completion criterion. Prefer falsification, unresolved blockers and theorem-critical work.'
+            ),
+        },
         {
             'id': 'researcher',
             'role': 'worker',
@@ -121,7 +134,14 @@ def research_manifest(name, goal):
             ),
             'tools': ['list', 'read', 'write', 'lab_execute'],
         },
-        {'id': 'referee', 'role': 'reviewer', 'instructions': 'Act independently and adversarially. Reject gaps, hidden assumptions, unsupported novelty and overclaiming.'},
+        {
+            'id': 'referee',
+            'role': 'reviewer',
+            'instructions': (
+                'Act independently and adversarially. Reject gaps, hidden assumptions, unsupported novelty and overclaiming. '
+                'Approval means the current task is actually resolved, not merely improved.'
+            ),
+        },
         {
             'id': 'verifier',
             'role': 'verifier',
@@ -159,7 +179,9 @@ def research_manifest(name, goal):
                     'Supported request actions include run, create_workspace, list_runs, latest_context and publish_context.'
                 ),
                 'command': 'python -m awb.core.research_lab execute lab_request.json',
-                'timeout_seconds': 360,
+                # Zero means no wall-clock wrapper timeout. The lab request itself
+                # can still carry an explicit bounded timeout when scientifically useful.
+                'timeout_seconds': 0,
             },
         ],
         'runtime': _runtime(),
@@ -168,7 +190,7 @@ def research_manifest(name, goal):
 
 def software_manifest(name, goal):
     agents = with_role_providers([
-        {'id': 'director', 'role': 'director', 'instructions': 'Prioritize user value, blockers, correctness and release criteria.'},
+        {'id': 'director', 'role': 'director', 'instructions': 'Prioritize one clear user-value increment or blocker with explicit release evidence and completion criteria.'},
         {
             'id': 'developer',
             'role': 'worker',
@@ -232,7 +254,7 @@ def software_manifest(name, goal):
 
 def custom_manifest(name, goal):
     agents = with_role_providers([
-        {'id': 'director', 'role': 'director', 'instructions': 'Choose the next task with the highest expected value for the goal.'},
+        {'id': 'director', 'role': 'director', 'instructions': 'Choose exactly one clear next task with an explicit objective and completion criterion.'},
         {'id': 'expert', 'role': 'worker', 'instructions': 'Execute the task and distinguish facts, assumptions, uncertainty and evidence.'},
         {'id': 'critic', 'role': 'reviewer', 'instructions': 'Challenge the result independently and reject unsupported claims.'},
         {'id': 'verifier', 'role': 'verifier', 'instructions': 'Check evidence and available external validators. Be conservative when certifying completion gates.'},

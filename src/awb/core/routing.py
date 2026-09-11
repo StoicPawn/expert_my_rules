@@ -12,7 +12,7 @@ from .models import ProjectManifest, ProviderSpec
 
 
 class RouteBusyError(RuntimeError):
-    """Raised when a compute node cannot provide a slot within the configured bound."""
+    """Raised only when a compute node has an explicit bounded queue timeout."""
 
 
 @dataclass
@@ -44,11 +44,10 @@ class ResolvedRoute:
 class ModelRouter:
     """Resolve logical agent roles onto replaceable compute nodes.
 
-    v0.5 keeps explicit route priority as the main policy while adding bounded
-    back-pressure, shared load awareness and a small circuit breaker. This matters
-    on both ends of the scaling path: an 8 GB always-on node must never load several
-    models concurrently, while a future GPU node that dies must fail over instead of
-    blocking an autonomous project forever.
+    On a tiny always-on machine the important invariant is one expensive generation
+    at a time. ``queue_timeout_seconds <= 0`` therefore means wait indefinitely for
+    the local slot: saturation is back-pressure, not a scientific/runtime failure.
+    Faster machines can still configure a positive bounded queue timeout.
     """
 
     def __init__(self, manifest: ProjectManifest):
@@ -60,8 +59,6 @@ class ModelRouter:
             base_url = os.getenv(node.base_url_env) if node.base_url_env else None
             base_url = base_url or node.base_url or 'default'
             capacity = max(1, int(node.max_concurrency))
-            # Capacity is part of the key so a process can safely load a changed
-            # manifest without reusing a semaphore created with a different limit.
             key = f'{node.kind}|{base_url}|{node.id}|{capacity}'
             self._slot_keys[node.id] = key
             with _SHARED_LOCK:
@@ -125,8 +122,6 @@ class ModelRouter:
             resolved_scored.sort(key=lambda item: item[0])
             return [item[1] for item in resolved_scored]
 
-        # If every configured route is cooling down, allow one half-open probe.
-        # Otherwise a transient outage could make the role unusable forever.
         if cooling and self.policy.allow_cooldown_probe:
             cooling.sort(key=lambda item: (item[0][1], item[0][0], item[0][2]))
             return [cooling[0][1]]
@@ -134,7 +129,6 @@ class ModelRouter:
         if configured and not resolved_scored and cooling:
             return []
 
-        # Backwards-compatible path for all v0.2 workspaces.
         spec = self._agent_provider(role)
         return [ResolvedRoute(node_id='legacy', kind=spec.kind, model=spec.model, source='legacy')]
 
@@ -149,11 +143,17 @@ class ModelRouter:
             yield
             return
 
-        timeout = max(0.0, float(self.policy.queue_timeout_seconds)) if self.policy.enabled else None
-        acquired = semaphore.acquire(timeout=timeout) if timeout is not None else semaphore.acquire()
+        configured_timeout = float(self.policy.queue_timeout_seconds) if self.policy.enabled else 0.0
+        if not self.policy.enabled or configured_timeout <= 0:
+            # Endurance mode: a busy CPU is expected. Wait until the previous role
+            # releases the only inference slot instead of turning load into ERROR.
+            semaphore.acquire()
+            acquired = True
+        else:
+            acquired = semaphore.acquire(timeout=configured_timeout)
         if not acquired:
             raise RouteBusyError(
-                f'Compute node {route.node_id} remained saturated for {timeout:.1f}s'
+                f'Compute node {route.node_id} remained saturated for {configured_timeout:.1f}s'
             )
         with _SHARED_LOCK:
             _SHARED_STATES[key].active += 1
@@ -213,6 +213,8 @@ class ModelRouter:
                 'cooldown_remaining_seconds': round(cooldown_remaining, 3),
                 'avg_seconds': round(total_seconds / successes, 3) if successes else None,
                 'chars_per_second': round(total_chars / total_seconds, 1) if total_seconds > 0 else None,
+                'queue_timeout_seconds': float(self.policy.queue_timeout_seconds),
+                'waits_indefinitely_when_busy': float(self.policy.queue_timeout_seconds) <= 0,
                 'tags': list(node.tags),
             })
         return out

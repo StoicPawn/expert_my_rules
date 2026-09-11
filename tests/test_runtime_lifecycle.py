@@ -57,51 +57,53 @@ class RuntimeLifecycleTests(unittest.TestCase):
             self.assertEqual(after.get_job(jid)['status'], JobStatus.CANCELLED.value)
             self.assertEqual(after.get_task('T1').status, TaskStatus.OPEN)
             self.assertTrue(fake.terminated)
+            self.assertTrue((root / 'project_state.json').exists())
 
-    def test_relaunch_keeps_only_one_reassessment_task(self):
+    def test_relaunch_preserves_existing_scientific_state_and_reopens_only_errors(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'AWB_WORKSPACES_DIR': tmp}, clear=False):
             root = self._workspace(tmp)
             ledger = Ledger(root / 'ledger.sqlite3')
             old = ledger.create_job(0, 0, continuous=True)
             ledger.update_job(old, status=JobStatus.FAILED, detail='old failure')
-            for idx in range(3):
-                ledger.upsert_task(Task(
-                    id=f'OLD-{idx}',
-                    title='Reassess project under the current setup',
-                    description='duplicate',
-                    status=TaskStatus.OPEN,
-                    priority=100,
-                    created_by='relaunch',
-                ))
+            ledger.upsert_task(Task(id='DONE', title='proved lemma', description='done', status=TaskStatus.DONE))
+            ledger.upsert_task(Task(id='NEG', title='false route', description='negative', status=TaskStatus.REJECTED, metadata={'rejection_reason':'counterexample'}))
+            ledger.upsert_task(Task(id='BLOCK', title='needs rework', description='blocked', status=TaskStatus.BLOCKED, metadata={'next_strategy':'repair proof'}))
+            ledger.upsert_task(Task(id='ERR', title='technical retry', description='retry', status=TaskStatus.ERROR))
             with patch.object(runtime_entry, '_start_process', return_value=None):
                 runtime_entry.launch_runtime('demo')
-            tasks = [t for t in Ledger(root / 'ledger.sqlite3').list_tasks() if t.created_by == 'relaunch']
-            self.assertEqual(len(tasks), 1)
-            self.assertEqual(tasks[0].id, 'RELAUNCH-REASSESS')
+            after = Ledger(root / 'ledger.sqlite3')
+            self.assertEqual(after.get_task('DONE').status, TaskStatus.DONE)
+            self.assertEqual(after.get_task('NEG').status, TaskStatus.REJECTED)
+            self.assertEqual(after.get_task('BLOCK').status, TaskStatus.BLOCKED)
+            self.assertEqual(after.get_task('ERR').status, TaskStatus.OPEN)
+            self.assertFalse(any(t.id == 'RELAUNCH-REASSESS' for t in after.list_tasks()))
+            self.assertEqual(after.latest_job()['status'], JobStatus.RUNNING.value)
 
     def test_terminal_job_never_displays_stale_generating_progress(self):
-        fake = {
-            'job': {'status': JobStatus.FAILED.value, 'detail': 'boom'},
-            'setup': {'status': 'READY'},
-            'runtime_progress': {'state': 'generating', 'role': 'worker'},
-            'current_task': {'id': 'T1'},
-            'tasks': [
-                {'id': 'R1', 'created_by': 'relaunch', 'status': 'ERROR'},
-                {'id': 'R2', 'created_by': 'relaunch', 'status': 'OPEN'},
-                {'id': 'A', 'created_by': 'system-planner', 'status': 'OPEN'},
-            ],
-            'done_tasks': 0,
-            'total_tasks': 3,
-        }
-        with patch.object(dashboard_runtime, '_base_state', return_value=fake):
-            response = dashboard_runtime.coherent_state('demo')
-        payload = json.loads(response.body)
-        self.assertEqual(payload['runtime_progress'], {})
-        self.assertIsNone(payload['current_task'])
-        self.assertEqual(payload['configuration_status'], 'READY')
-        self.assertEqual(payload['run_status'], JobStatus.FAILED.value)
-        self.assertEqual(payload['overall_status'], 'RUN_FAILED')
-        self.assertEqual(sum(1 for t in payload['tasks'] if t['created_by'] == 'relaunch'), 1)
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'AWB_WORKSPACES_DIR': tmp}, clear=False):
+            root = self._workspace(tmp)
+            ledger = Ledger(root / 'ledger.sqlite3')
+            jid = ledger.create_job(0, 0, continuous=True)
+            ledger.update_job(jid, status=JobStatus.FAILED, detail='boom')
+            fake = {
+                'job': {'id': jid, 'status': JobStatus.FAILED.value, 'detail': 'boom'},
+                'setup': {'status': 'READY'},
+                'runtime_progress': {'state': 'generating', 'role': 'worker'},
+                'current_task': {'id': 'T1'},
+                'tasks': [
+                    {'id': 'A', 'created_by': 'system-planner', 'status': 'OPEN'},
+                ],
+                'done_tasks': 0,
+                'total_tasks': 1,
+            }
+            with patch.object(dashboard_runtime, '_base_state', return_value=fake):
+                response = dashboard_runtime.coherent_state('demo')
+            payload = json.loads(response.body)
+            self.assertEqual(payload['runtime_progress'], {})
+            self.assertIsNone(payload['current_task'])
+            self.assertEqual(payload['configuration_status'], 'READY')
+            self.assertEqual(payload['run_status'], JobStatus.FAILED.value)
+            self.assertEqual(payload['overall_status'], 'RUN_FAILED')
 
 
 if __name__ == '__main__':

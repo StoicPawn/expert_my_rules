@@ -1,0 +1,1 @@
+authorized 2026-09-11: cancel current Expert My Rules task, preserve durable ledger/checkpoint state, deploy local-first endurance runtime, then relaunch the same project from persisted state.
