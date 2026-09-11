@@ -19,13 +19,17 @@ _app_module.Orchestrator = DeepIterativeEngine
 # reference with CheckpointedDeepIterativeEngine without changing core modules.
 from awb.web import checkpoint_runtime as _checkpoint_runtime  # noqa: F401,E402
 
-# Final UI layer: exactly one project list/system page, one project dashboard and
-# one project setup page. It is installed last so it replaces the historical
-# Control/Dashboard/Lab navigation without changing the durable runtime semantics.
+# Keep the global projects/system-resource page and durable runtime semantics from
+# unified_control. The final project-console layer is intentionally installed last:
+# it removes historic setup/dashboard route variants by route shape, including old
+# parameter names such as {slug_}, and exposes one project URL with in-page State,
+# Output and Configuration sections.
 from awb.web import runtime_entry as _runtime_entry  # noqa: E402
 from awb.web import unified_control as _unified_control  # noqa: E402
 from awb.web.unified_control import install_unified_control  # noqa: E402
 from awb.web.unified_runtime_compat import install_runtime_compat  # noqa: E402
+from awb.web.project_console import install_project_console  # noqa: E402
 
 install_unified_control(_runtime_entry.control_app, _runtime_entry)
 install_runtime_compat(_runtime_entry, _unified_control)
+install_project_console(_runtime_entry.control_app, _runtime_entry, _unified_control)
