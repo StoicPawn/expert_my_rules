@@ -11,8 +11,8 @@ from awb.templates.templates import custom_manifest, research_manifest, software
 EXPECTED = {
     'director': 'qwen3:4b',
     'worker': 'qwen3:4b',
-    'reviewer': 'llama3.2:3b',
-    'verifier': 'gemma3:4b',
+    'reviewer': 'qwen3:4b',
+    'verifier': 'qwen3:4b',
 }
 
 
@@ -38,15 +38,18 @@ class FakePlannerProvider:
 
 
 class MultiModelDefaultTests(unittest.TestCase):
-    def test_all_templates_use_heterogeneous_role_models(self):
+    def test_all_templates_use_one_resident_acepc_model(self):
         with patch.dict(os.environ, {}, clear=True):
             for factory in (research_manifest, software_manifest, custom_manifest):
                 manifest = factory('demo', 'finish the goal')
                 models = role_models(manifest)
                 self.assertEqual(models, EXPECTED)
-                self.assertEqual(len(set(models.values())), 3)
+                self.assertEqual(set(models.values()), {'qwen3:4b'})
+                self.assertEqual(manifest['runtime']['scheduler']['queue_timeout_seconds'], 0.0)
+                self.assertEqual(manifest['runtime']['continuous_session_minutes'], 0)
+                self.assertGreaterEqual(manifest['runtime']['max_tool_calls_per_task'], 50)
 
-    def test_planner_generated_agents_keep_role_model_diversity(self):
+    def test_planner_generated_agents_keep_single_model_role_prompts(self):
         with patch.dict(os.environ, {}, clear=True), patch(
             'awb.core.planner.make_provider', return_value=FakePlannerProvider()
         ):
@@ -57,7 +60,7 @@ class MultiModelDefaultTests(unittest.TestCase):
             )
         self.assertEqual(role_models(manifest), EXPECTED)
 
-    def test_role_specific_model_overrides_do_not_collapse_other_roles(self):
+    def test_role_specific_model_overrides_remain_possible_for_future_hardware(self):
         env = {
             'AWB_WORKER_MODEL': 'qwen-custom:4b',
             'AWB_DIRECTOR_MODEL': 'qwen-director:4b',
@@ -71,16 +74,13 @@ class MultiModelDefaultTests(unittest.TestCase):
         self.assertEqual(models['reviewer'], 'llama-custom:3b')
         self.assertEqual(models['verifier'], 'gemma-custom:4b')
 
-    def test_bootstrap_requires_the_three_default_models_and_disk_budget(self):
+    def test_bootstrap_and_compose_enforce_one_loaded_model(self):
         repo = Path(__file__).resolve().parents[1]
-        for filename in ('first-run.sh', 'first-run.ps1'):
-            text = (repo / filename).read_text()
-            for model in ('qwen3:4b', 'llama3.2:3b', 'gemma3:4b'):
-                self.assertIn(model, text)
-            self.assertIn('20', text)
-
         compose = (repo / 'docker-compose.yml').read_text()
         self.assertIn('OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}', compose)
+        self.assertIn('OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-1}', compose)
+        self.assertIn('AWB_REVIEWER_MODEL=${AWB_REVIEWER_MODEL:-qwen3:4b}', compose)
+        self.assertIn('AWB_STREAM_TRACE_DIR=/data/workspaces/.awb-streams', compose)
 
 
 if __name__ == '__main__':
