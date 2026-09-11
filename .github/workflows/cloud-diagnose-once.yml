@@ -1,0 +1,72 @@
+name: cloud-diagnose-once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/cloud-diagnose-once.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: [self-hosted, linux, expert-local]
+    timeout-minutes: 10
+    steps:
+      - name: Diagnose latest cloud failure on ACEPC
+        shell: bash
+        env:
+          DEPLOY_DIR: /home/stoicpawn/projects/expert_my_rules
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_DIR"
+          test -f .env
+          docker compose --env-file .env exec -T expert-my-rules python - <<'PY'
+          import json, os, sqlite3
+          from pathlib import Path
+          import httpx
+
+          print('OPENAI_API_KEY_CONFIGURED=', bool(os.getenv('OPENAI_API_KEY')))
+          print('OPENAI_API_KEY_LENGTH=', len(os.getenv('OPENAI_API_KEY') or ''))
+          print('OPENAI_BASE_URL=', os.getenv('OPENAI_BASE_URL', 'https://api.openai.com'))
+
+          for db in sorted(Path('/data/workspaces').glob('*/ledger.sqlite3')):
+              conn = sqlite3.connect(db, timeout=15)
+              try:
+                  rows = conn.execute("""
+                      SELECT ts, kind, task_id, payload_json
+                      FROM events
+                      WHERE kind IN ('model_call_failed','cloud_call_fallback_local','cloud_budget_released','model_escalated')
+                      ORDER BY ts DESC LIMIT 12
+                  """).fetchall()
+              finally:
+                  conn.close()
+              if rows:
+                  print('WORKSPACE=', db.parent.name)
+                  for ts, kind, task_id, payload in rows:
+                      try:
+                          data = json.loads(payload or '{}')
+                      except Exception:
+                          data = {'raw': payload}
+                      # Never print headers, keys or arbitrary prompt content.
+                      safe = {k: data.get(k) for k in ('role','model','node','kind','error','seconds','reservation_held_fail_closed','reason') if k in data}
+                      print(json.dumps({'ts':ts,'kind':kind,'task_id':task_id,'payload':safe}, ensure_ascii=False))
+
+          key = os.getenv('OPENAI_API_KEY') or ''
+          if key:
+              headers = {'Authorization': f'Bearer {key}'}
+              for model in ('gpt-5.6-luna','gpt-5.6-terra','gpt-5.6-sol'):
+                  try:
+                      r = httpx.get(f'https://api.openai.com/v1/models/{model}', headers=headers, timeout=15.0)
+                      msg = ''
+                      if r.status_code >= 400:
+                          try:
+                              err = r.json().get('error', {})
+                              msg = str(err.get('code') or err.get('type') or '') + ': ' + str(err.get('message') or '')
+                          except Exception:
+                              msg = r.text[:500]
+                      print('MODEL_CHECK', model, r.status_code, msg[:1000])
+                  except Exception as exc:
+                      print('MODEL_CHECK', model, type(exc).__name__, str(exc)[:1000])
+          PY
