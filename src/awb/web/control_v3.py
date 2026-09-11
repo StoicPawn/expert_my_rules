@@ -15,6 +15,7 @@ from awb.core.planner import propose_manifest
 from awb.core.source_material import SourceMaterialError, ingest_source, list_sources
 from awb.core.storage import Ledger
 from awb.core.workspace import load_workspace, save_manifest, write_workspace
+from awb.providers.runtime_progress import get_progress
 from awb.web.control_app import (
     _ensure_all_source_tasks,
     _ensure_source_access,
@@ -26,6 +27,7 @@ from awb.web.control_app import (
     index as legacy_index,
 )
 from awb.web.app import _start, base_dir, slug
+from awb.web.resource_monitor import _resource_snapshot
 from awb.web.ui import badge, esc
 
 SETUP_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix='awb-setup')
@@ -62,14 +64,14 @@ def _setup_state_path(root: Path) -> Path:
 def _load_setup_state(root: Path) -> dict:
     path = _setup_state_path(root)
     if not path.exists():
-        return {'status': 'NOT_STARTED', 'revision': 0, 'detail': ''}
+        return {'status': 'NOT_STARTED', 'revision': 0, 'stage': 'IDLE', 'detail': ''}
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
         if isinstance(data, dict):
             return data
     except Exception:
         pass
-    return {'status': 'ERROR', 'revision': 0, 'detail': 'Stato setup non leggibile'}
+    return {'status': 'ERROR', 'revision': 0, 'stage': 'ERROR', 'detail': 'Stato setup non leggibile'}
 
 
 def _save_setup_state(root: Path, **updates) -> dict:
@@ -80,6 +82,18 @@ def _save_setup_state(root: Path, **updates) -> dict:
     tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding='utf-8')
     tmp.replace(_setup_state_path(root))
     return state
+
+
+def _elapsed_since(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        started = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - started.astimezone(timezone.utc)).total_seconds())
+    except Exception:
+        return None
 
 
 def _source_context(root: Path, max_chars: int = 14000) -> str:
@@ -121,17 +135,30 @@ def _refresh_system_plan(root: Path, revision: int) -> None:
 
 def _run_auto_setup(root: Path) -> None:
     project = root.name
+    started_at = datetime.now(timezone.utc).isoformat()
     try:
         current = _load_setup_state(root)
         revision = int(current.get('revision', 0)) + 1
-        _save_setup_state(root, status='RUNNING', revision=revision, detail='Sto generando team, ruoli, Definition of Done e piano iniziale.')
+        _save_setup_state(
+            root,
+            status='RUNNING', revision=revision, stage='PREPARING', started_at=started_at,
+            detail='Preparo North Star e materiale iniziale per il planner locale.',
+        )
         ws = load_workspace(root)
         original_goal = ws.manifest.goal.strip()
         context = _source_context(root)
         planner_goal = original_goal
         if context:
             planner_goal += '\n\nUSER-PROVIDED STARTING MATERIAL CONTEXT. Tailor the team instructions and completion gates to this material, but do not treat its claims as automatically correct:\n' + context
+        _save_setup_state(
+            root, status='RUNNING', stage='PLANNING',
+            detail='Il planner locale sta definendo team, ruoli e Definition of Done.',
+        )
         planned = propose_manifest(planner_goal, ws.manifest.name, use_local_ai=True)
+        _save_setup_state(
+            root, status='RUNNING', stage='APPLYING',
+            detail='Applico il setup proposto e costruisco il piano iniziale.',
+        )
         ws = load_workspace(root)
         if isinstance(planned.get('description'), str) and planned['description'].strip():
             ws.manifest.description = planned['description'].strip()
@@ -160,16 +187,27 @@ def _run_auto_setup(root: Path) -> None:
         ledger = Ledger(root / 'ledger.sqlite3')
         for gate in load_workspace(root).manifest.gates:
             ledger.set_gate(gate.id, False, f'reset by automatic setup revision {revision}')
+        _save_setup_state(
+            root, status='RUNNING', stage='FINALIZING',
+            detail='Finalizzo task iniziali e accesso alle fonti.',
+        )
         _refresh_system_plan(root, revision)
         _ensure_all_source_tasks(root)
-        ledger.event('automatic_setup_completed', {'revision': revision, 'source_count': len(list_sources(root)), 'gate_count': len(load_workspace(root).manifest.gates)})
-        _save_setup_state(root, status='READY', revision=revision, detail='Setup automatico pronto e modificabile.')
+        elapsed = _elapsed_since(started_at)
+        ledger.event('automatic_setup_completed', {'revision': revision, 'source_count': len(list_sources(root)), 'gate_count': len(load_workspace(root).manifest.gates), 'elapsed_seconds': elapsed})
+        _save_setup_state(
+            root, status='READY', stage='DONE', finished_at=datetime.now(timezone.utc).isoformat(),
+            elapsed_seconds=elapsed, detail='Setup automatico pronto e modificabile.',
+        )
     except Exception as exc:
         try:
             Ledger(root / 'ledger.sqlite3').event('automatic_setup_failed', {'error': f'{type(exc).__name__}: {exc}'})
         except Exception:
             pass
-        _save_setup_state(root, status='ERROR', detail=f'{type(exc).__name__}: {exc}')
+        _save_setup_state(
+            root, status='ERROR', stage='ERROR', finished_at=datetime.now(timezone.utc).isoformat(),
+            elapsed_seconds=_elapsed_since(started_at), detail=f'{type(exc).__name__}: {exc}',
+        )
     finally:
         with SETUP_LOCK:
             SETUP_ACTIVE.discard(project)
@@ -179,14 +217,14 @@ def _schedule_auto_setup(root: Path, reason: str) -> bool:
     project = root.name
     current_job = Ledger(root / 'ledger.sqlite3').latest_job()
     if current_job and current_job['status'] in {JobStatus.RUNNING.value, JobStatus.PAUSED.value}:
-        _save_setup_state(root, status='DEFERRED', detail='Setup automatico rinviato: termina il job prima di rigenerarlo.')
+        _save_setup_state(root, status='DEFERRED', stage='WAITING_FOR_JOB', detail='Setup automatico rinviato: termina il job prima di rigenerarlo.')
         return False
     with SETUP_LOCK:
         if project in SETUP_ACTIVE:
-            _save_setup_state(root, status='QUEUED', detail='Nuovo materiale ricevuto: rigenerazione accodata.')
+            _save_setup_state(root, status='QUEUED', stage='QUEUED', detail='Nuovo materiale ricevuto: rigenerazione accodata.')
             return False
         SETUP_ACTIVE.add(project)
-    _save_setup_state(root, status='QUEUED', detail=f'Autoconfigurazione accodata: {reason}.')
+    _save_setup_state(root, status='QUEUED', stage='QUEUED', queued_at=datetime.now(timezone.utc).isoformat(), detail=f'Autoconfigurazione accodata: {reason}.')
     SETUP_EXECUTOR.submit(_run_auto_setup, root)
     return True
 
@@ -200,7 +238,11 @@ def _project_editor_panels(root: Path) -> tuple[str, str]:
     agent_forms = []
     for agent in ws.manifest.agents:
         agent_forms.append(f"<div class='task'><form method='post' action='/project/{esc(root.name)}/agent/edit'><input type='hidden' name='role' value='{esc(agent.role)}'><div class='split'><b>{esc(agent.id)}</b>{badge(agent.role)}</div><label>Cosa deve fare</label><textarea name='instructions' rows='4'>{esc(agent.instructions)}</textarea><button class='secondary'>Salva ruolo</button></form></div>")
-    agent_editor = f"<div class='card' style='margin-top:14px'><h2>Istruzioni dei ruoli</h2><p class='small muted'>Puoi modificare cosa fa ciascun agente senza cambiare il modello assegnato.</p>{''.join(agent_forms)}</div>"
+    agent_editor = (
+        f"<details class='card' style='margin-top:14px'><summary style='cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:12px'>"
+        f"<span><b>Agenti del setup</b><span class='small muted' style='display:block'>Apri solo quando vuoi vedere o modificare i ruoli.</span></span>{badge(str(len(agent_forms)) + ' agenti')}</summary>"
+        f"<div style='max-height:65vh;overflow:auto;margin-top:14px;padding-right:4px'>{''.join(agent_forms)}</div></details>"
+    )
     return gate_editor, agent_editor
 
 
@@ -209,7 +251,8 @@ def _setup_banner(root: Path) -> str:
     status = str(state.get('status', 'NOT_STARTED'))
     kind = 'ok' if status == 'READY' else 'bad' if status == 'ERROR' else 'warn'
     label = {'READY': 'SETUP PRONTO', 'RUNNING': 'SETUP IN CORSO', 'QUEUED': 'SETUP IN CODA', 'DEFERRED': 'SETUP RINVIATO', 'ERROR': 'ERRORE SETUP'}.get(status, status)
-    return f"<div class='card hero'><div class='split'><div><h2>Autoconfigurazione</h2><p class='small muted'>North Star + materiale allegato → team, ruoli, Definition of Done e piano iniziale. Poi puoi modificare tutto manualmente.</p></div>{badge(label, kind)}</div><p>{esc(str(state.get('detail') or ''))}</p><form method='post' action='/project/{esc(root.name)}/auto-setup'><button class='secondary'>Rigenera setup automaticamente</button></form></div>"
+    stage = str(state.get('stage') or '')
+    return f"<div class='card hero' data-setup-card><div class='split'><div><h2>Autoconfigurazione</h2><p class='small muted'>North Star + materiale allegato → team, ruoli, Definition of Done e piano iniziale. Poi puoi modificare tutto manualmente.</p></div>{badge(label, kind)}</div><p data-setup-detail>{esc(str(state.get('detail') or ''))}</p><div data-setup-live class='small muted'>{esc(stage)}</div><form method='post' action='/project/{esc(root.name)}/auto-setup'><button class='secondary'>Rigenera setup automaticamente</button></form></div>"
 
 
 @control_app.get('/', response_class=HTMLResponse)
@@ -266,18 +309,40 @@ def project_v3(request: Request, project: str):
     if job and job['status'] in TERMINAL_JOB_STATES:
         html = html.replace('>Avvia progetto autonomo</button>', '>Rilancia progetto autonomo</button>', 1)
         html = html.replace('Job autonomo</h2>', "Job autonomo</h2><p class='small muted'>Il progetto resta riutilizzabile: modifica setup e rilancialo quando vuoi.</p>", 1)
+    setup_state = _load_setup_state(root)
+    if setup_state.get('status') in {'RUNNING', 'QUEUED'} and not (job and job['status'] in {JobStatus.RUNNING.value, JobStatus.PAUSED.value}):
+        html = html.replace('>Avvia progetto autonomo</button>', " disabled title='Attendi il completamento del setup'>Setup in corso…</button>", 1)
+        html = html.replace('>Rilancia progetto autonomo</button>', " disabled title='Attendi il completamento del setup'>Setup in corso…</button>", 1)
     delete_panel = f"<div class='card'><h2>Gestione progetto</h2><p class='small muted'>Il progetto e la cronologia restano disponibili finché non li elimini esplicitamente.</p><form method='post' action='/project/{esc(project)}/delete' onsubmit=\"return confirm('Eliminare definitivamente questo progetto e la sua cronologia?')\"><button class='danger'>Elimina progetto</button></form></div>"
     html = html.replace("<div class='col-5 card'><h2>Collegamenti</h2>", "<div class='col-5'><div class='card'><h2>Collegamenti</h2>", 1)
     html = html.replace("Setup, monitoraggio e laboratorio sono separati per evitare un'unica pagina tecnica troppo densa.</p></div></div></section>", f"Setup, monitoraggio e laboratorio sono separati per evitare un'unica pagina tecnica troppo densa.</p></div>{delete_panel}</div></div></section>", 1)
-    state = _load_setup_state(root)
-    if state.get('status') in {'RUNNING', 'QUEUED'}:
-        html = html.replace('</script></body></html>', 'setTimeout(()=>location.reload(),2500);</script></body></html>')
     return HTMLResponse(html, headers={'Cache-Control': 'no-store'})
 
 
 @control_app.get('/project/{project}/setup-status')
 def setup_status(project: str):
-    return JSONResponse(_load_setup_state(_root(project)))
+    root = _root(project)
+    state = dict(_load_setup_state(root))
+    elapsed = state.get('elapsed_seconds')
+    if state.get('status') in {'RUNNING', 'QUEUED'}:
+        elapsed = _elapsed_since(state.get('started_at') or state.get('queued_at'))
+    state['elapsed_seconds'] = elapsed
+    progress = get_progress() or {}
+    if progress.get('role') == 'planner' or state.get('status') in {'RUNNING', 'QUEUED'}:
+        state['model_progress'] = progress
+    else:
+        state['model_progress'] = {}
+    state['resources'] = _resource_snapshot()
+    if state.get('status') == 'RUNNING':
+        if progress.get('role') == 'planner' and int(progress.get('health_failures') or 0) > 0:
+            state['liveness'] = 'DEGRADED'
+        elif progress.get('role') == 'planner':
+            state['liveness'] = 'ACTIVE'
+        else:
+            state['liveness'] = 'WAITING_FOR_PROGRESS'
+    else:
+        state['liveness'] = state.get('status')
+    return JSONResponse(state, headers={'Cache-Control': 'no-store'})
 
 
 @control_app.post('/project/{project}/auto-setup')
@@ -373,7 +438,11 @@ def delete_gate(project: str, gate_id: str = Form(...)):
 
 @control_app.post('/project/{project}/launch')
 def launch_v3(project: str):
-    root = _root(project); ledger = Ledger(root / 'ledger.sqlite3'); current = ledger.latest_job()
+    root = _root(project)
+    setup_state = _load_setup_state(root)
+    if setup_state.get('status') in {'RUNNING', 'QUEUED'}:
+        raise HTTPException(409, 'Attendi che il setup automatico sia terminato prima di avviare il job.')
+    ledger = Ledger(root / 'ledger.sqlite3'); current = ledger.latest_job()
     if current and current['status'] in {JobStatus.RUNNING.value, JobStatus.PAUSED.value}:
         jid = current['id']
     else:
