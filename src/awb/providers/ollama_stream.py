@@ -19,6 +19,7 @@ class OllamaLivenessError(RuntimeError):
 
 _END = object()
 _ROLE_TOKEN_DEFAULTS = {
+    'planner': 1400,
     'director': 1200,
     'worker': 8192,
     'reviewer': 2200,
@@ -56,7 +57,7 @@ class OllamaProvider(ModelProvider):
 
     Role-specific output/reasoning budgets prevent orchestration JSON from consuming
     the same CPU budget as theorem construction. The Worker remains the high-reasoning
-    path; Director defaults to think=false on Qwen-family models.
+    path; Planner and Director default to think=false on Qwen-family models.
     """
 
     def __init__(self, model: str, base_url: str | None = None):
@@ -80,7 +81,7 @@ class OllamaProvider(ModelProvider):
         )
 
     def configure_role(self, role: str) -> None:
-        """Apply a cheap orchestration budget without weakening Worker reasoning."""
+        """Apply role-specific cost/reasoning limits without a wall-clock timeout."""
         self.role = role
         default_tokens = _ROLE_TOKEN_DEFAULTS.get(role, self.max_output_tokens)
         self.max_output_tokens = _env_int(
@@ -89,7 +90,7 @@ class OllamaProvider(ModelProvider):
         explicit = _env_optional_bool(f'AWB_OLLAMA_{role.upper()}_THINK')
         if explicit is not None:
             self.think = explicit
-        elif role == 'director' and self.model.lower().startswith('qwen3'):
+        elif role in {'planner', 'director'} and self.model.lower().startswith('qwen3'):
             self.think = False
         elif role == 'worker' and self.model.lower().startswith('qwen3'):
             self.think = True
