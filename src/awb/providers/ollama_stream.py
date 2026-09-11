@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from awb.core.resource_policy import model_options_from_resource_file
 from .base import ModelProvider
 from .runtime_cancel import (
     ModelGenerationCancelled,
@@ -119,8 +120,6 @@ class OllamaProvider(ModelProvider):
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
-        # Operational estimate only; exact prompt/eval counts replace it when Ollama
-        # returns them on the final stream record.
         raw = str(text or '')
         return max(0, (len(raw.encode('utf-8')) + 3) // 4)
 
@@ -163,8 +162,11 @@ class OllamaProvider(ModelProvider):
                 {'role': 'user', 'content': user},
             ],
         }
+        options: dict[str, Any] = model_options_from_resource_file()
         if self.max_output_tokens > 0:
-            payload['options'] = {'num_predict': self.max_output_tokens}
+            options['num_predict'] = self.max_output_tokens
+        if options:
+            payload['options'] = options
         if self.think is not None:
             payload['think'] = self.think
 
@@ -199,12 +201,12 @@ class OllamaProvider(ModelProvider):
                     'system_prompt': system,
                     'user_prompt': user,
                     'visible_output': visible,
+                    'resource_options': options,
                 }
                 tmp = trace_path.with_suffix('.tmp')
                 tmp.write_text(json.dumps(doc, ensure_ascii=False), encoding='utf-8')
                 tmp.replace(trace_path)
             except Exception:
-                # Observability must never be able to break scientific work.
                 pass
 
         def reader() -> None:
@@ -252,6 +254,7 @@ class OllamaProvider(ModelProvider):
                 'thinking_enabled': self.think,
                 'last_stream_activity_seconds': round(now - last_stream_activity, 3),
                 'health_failures': health_failures,
+                'resource_options': options,
                 **extra,
             }
             set_progress(self.model, payload_event)
@@ -267,7 +270,7 @@ class OllamaProvider(ModelProvider):
             'prompt_tokens_exact': False, 'output_tokens_exact': False,
             'visible_tail': '', 'max_output_tokens': self.max_output_tokens,
             'thinking_enabled': self.think, 'last_stream_activity_seconds': 0.0,
-            'health_failures': 0,
+            'health_failures': 0, 'resource_options': options,
         })
         write_trace('starting', now)
         try:
